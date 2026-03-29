@@ -1,3 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# fmt: off
+
 from dataclasses import replace
 from typing import Optional
 
@@ -28,7 +51,7 @@ def pick_random_token(
         The selected token.
 
     """
-    return tokens[random.integers(len(tokens))]
+    return tokens[random.randint(len(tokens))]
 
 
 def pick_chain_token(
@@ -255,11 +278,11 @@ class BoltzCropper(Cropper):
             interface = interfaces[interface_id]
             query = pick_interface_token(valid_tokens, interface, random)
         elif valid_interfaces.size:
-            idx = random.integers(len(valid_interfaces))
+            idx = random.randint(len(valid_interfaces))
             interface = valid_interfaces[idx]
             query = pick_interface_token(valid_tokens, interface, random)
         else:
-            idx = random.integers(len(valid_chains))
+            idx = random.randint(len(valid_chains))
             chain_id = valid_chains[idx]["asym_id"]
             query = pick_chain_token(valid_tokens, chain_id, random)
 
@@ -354,7 +377,8 @@ class BoltzCropper(Cropper):
                     # We switch to the res_idx instead of the token_idx to always
                     # include all tokens from modified residues or from ligands.
                     min_idx = max_idx = center_token["res_idx"]
-                    while new_tokens.size < neighborhood_size_to_use:
+                    target_size = min(neighborhood_size_to_use, max_token_set.size)
+                    while new_tokens.size < target_size:
                         min_idx = min_idx - 1
                         max_idx = max_idx + 1
                         new_tokens = max_token_set

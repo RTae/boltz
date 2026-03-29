@@ -75,7 +75,7 @@ data:
     _target_: boltz.data.feature.featurizerv2_train.Boltz2Featurizer
 
   moldir: #PATH_HERE
-  max_tokens: 384  # 640
+  max_tokens: 384  # 640 # NOTE: cuEq TriAttn backend on sm100f GPUs requires multiples of 8 token counts per CP shard
   max_atoms: 3456 # 5760
   max_seqs: 8192
   pad_to_max_tokens: true
@@ -224,11 +224,11 @@ model:
 
   diffusion_process_args:
     sigma_min: 0.0004
-    sigma_max: 160.0  
-    sigma_data: 16.0  
-    rho: 7  
-    P_mean: -1.2 
-    P_std: 1.5  
+    sigma_max: 160.0
+    sigma_data: 16.0
+    rho: 7
+    P_mean: -1.2
+    P_std: 1.5
     gamma_0: 0.8
     gamma_min: 1.0
     noise_scale: 1.0

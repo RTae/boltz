@@ -1,3 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# fmt: off
+
 import os
 import random
 import string
@@ -11,6 +34,8 @@ import omegaconf
 import pytorch_lightning as pl
 import torch
 import torch.multiprocessing
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf, listconfig
 from pytorch_lightning import LightningModule
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
@@ -20,6 +45,7 @@ from pytorch_lightning.utilities import rank_zero_only
 
 from boltz.data.module.training import BoltzTrainingDataModule, DataConfig
 from boltz.data.module.trainingv2 import Boltz2TrainingDataModule, DataConfigV2
+from boltz.workflow.utils import _DATASET_KEYS_TO_OVERRIDE, convert_datasets_dict_to_list_config
 
 
 @dataclass
@@ -92,11 +118,25 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
         Any command line overrides.
 
     """
-    # Load the configuration
-    raw_config = omegaconf.OmegaConf.load(raw_config)
+    # Load the configuration (with optional Hydra defaults support)
+    raw_config_path = raw_config
+    raw_config = omegaconf.OmegaConf.load(raw_config_path)
+    if "defaults" in raw_config:
+        config_path = Path(raw_config_path)
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=str(config_path.parent.absolute()), version_base=None):
+            raw_config = compose(config_name=config_path.stem)
+    omegaconf.OmegaConf.set_struct(raw_config, False)
 
     # Apply input arguments
     args = omegaconf.OmegaConf.from_dotlist(args)
+    if "data" in args and "datasets" in args.data and "data" in raw_config and "datasets" in raw_config.data:
+        args["data"]["datasets"] = convert_datasets_dict_to_list_config(
+            raw_config.data.datasets,
+            args.data.datasets,
+            keys_to_override=_DATASET_KEYS_TO_OVERRIDE,
+            remove_null_datasets=True,
+        )
     raw_config = omegaconf.OmegaConf.merge(raw_config, args)
 
     # Instantiate the task
@@ -166,8 +206,11 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
             file_path = cfg.pretrained
 
         print(f"Loading model from {file_path}")
+        hparams = dict(model_module.hparams)
+        if getattr(model_module, "validate_structure", False) and hasattr(model_module, "validators"):
+            hparams["validators"] = model_module.validators
         model_module = type(model_module).load_from_checkpoint(
-            file_path, map_location="cpu", strict=False, **(model_module.hparams)
+            file_path, map_location="cpu", strict=False, **hparams
         )
 
         if cfg.load_confidence_from_trunk:
@@ -189,12 +232,16 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
     # Create wandb logger
     loggers = []
     if wandb:
+        wandb_id = wandb.get("id")
+        wandb_resume = "allow" if wandb_id else None
         wdb_logger = WandbLogger(
             name=wandb["name"],
             group=wandb["name"],
             save_dir=cfg.output,
             project=wandb["project"],
             entity=wandb["entity"],
+            id=wandb_id,
+            resume=wandb_resume,
             log_model=False,
         )
         loggers.append(wdb_logger)

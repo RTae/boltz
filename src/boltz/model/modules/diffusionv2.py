@@ -1,3 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# fmt: off
+
 # started from code from https://github.com/lucidrains/alphafold3-pytorch, MIT License, Copyright (c) 2024 Phil Wang
 
 from __future__ import annotations
@@ -136,12 +159,16 @@ class DiffusionModule(Module):
                 s_inputs.repeat_interleave(multiplicity, 0),
             )
 
+        # Promote to at least float32 for numerical stability, but preserve
+        # higher precision (e.g. float64) if available.
+        compute_dtype = torch.promote_types(r_noisy.dtype, torch.float32)
+
         # Sequence-local Atom Attention and aggregation to coarse-grained tokens
         a, q_skip, c_skip, to_keys = self.atom_attention_encoder(
             feats=feats,
-            q=diffusion_conditioning["q"].float(),
-            c=diffusion_conditioning["c"].float(),
-            atom_enc_bias=diffusion_conditioning["atom_enc_bias"].float(),
+            q=diffusion_conditioning["q"].to(compute_dtype),
+            c=diffusion_conditioning["c"].to(compute_dtype),
+            atom_enc_bias=diffusion_conditioning["atom_enc_bias"].to(compute_dtype),
             to_keys=diffusion_conditioning["to_keys"],
             r=r_noisy,  # Float['b m 3'],
             multiplicity=multiplicity,
@@ -153,11 +180,11 @@ class DiffusionModule(Module):
         mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
         a = self.token_transformer(
             a,
-            mask=mask.float(),
+            mask=mask.to(compute_dtype),
             s=s,
             bias=diffusion_conditioning[
                 "token_trans_bias"
-            ].float(),  # note z is not expanded with multiplicity until after bias is computed
+            ].to(compute_dtype),  # note z is not expanded with multiplicity until after bias is computed
             multiplicity=multiplicity,
         )
         a = self.a_norm(a)
@@ -167,7 +194,7 @@ class DiffusionModule(Module):
             a=a,
             q=q_skip,
             c=c_skip,
-            atom_dec_bias=diffusion_conditioning["atom_dec_bias"].float(),
+            atom_dec_bias=diffusion_conditioning["atom_dec_bias"].to(compute_dtype),
             feats=feats,
             multiplicity=multiplicity,
             to_keys=to_keys,
@@ -257,7 +284,10 @@ class AtomDiffusion(Module):
         batch, device = noised_atom_coords.shape[0], noised_atom_coords.device
 
         if isinstance(sigma, float):
-            sigma = torch.full((batch,), sigma, device=device)
+            # Preserve dtype of noised_atom_coords (e.g. float64 for testing).
+            # Without this, torch.full defaults to float32, causing dtype mismatch
+            # in downstream FourierEmbedding when the model is in float64.
+            sigma = torch.full((batch,), sigma, device=device, dtype=noised_atom_coords.dtype)
 
         padded_sigma = rearrange(sigma, "b -> b 1 1")
 
@@ -382,21 +412,37 @@ class AtomDiffusion(Module):
 
             with torch.no_grad():
                 atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
+                B_local = atom_coords_noisy.shape[0] // multiplicity
                 sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
+                # ceiling division: ceil(multiplicity / max_parallel_samples).
+                # The original formula (multiplicity % max_parallel_samples + 1) was incorrect
+                # when multiplicity is an exact non-trivial multiple of max_parallel_samples
+                # (e.g., multiplicity=4, max_parallel_samples=2 gave 1 chunk instead of 2).
                 sample_ids_chunks = sample_ids.chunk(
-                    multiplicity % max_parallel_samples + 1
+                    (multiplicity + max_parallel_samples - 1) // max_parallel_samples
                 )
 
                 for sample_ids_chunk in sample_ids_chunks:
+                    chunk_M = sample_ids_chunk.numel()
+                    # atom_coords_noisy is (B*M, N, 3). We must unflatten to (B, M, N, 3)
+                    # and index the M axis — not dim 0 directly — because
+                    # preconditioned_network_forward passes **network_condition_kwargs
+                    # (feats, s_inputs, s_trunk, etc.) which have the full B batch
+                    # dimension. A naïve dim-0 index would select B*chunk_M rows that
+                    # mix batch and multiplicity positions, causing a shape mismatch
+                    # with the un-indexed conditioning tensors inside the score model.
+                    noisy_chunk = atom_coords_noisy.unflatten(0, (B_local, multiplicity))[:, sample_ids_chunk].flatten(0, 1)
                     atom_coords_denoised_chunk = self.preconditioned_network_forward(
-                        atom_coords_noisy[sample_ids_chunk],
+                        noisy_chunk,
                         t_hat,
                         network_condition_kwargs=dict(
-                            multiplicity=sample_ids_chunk.numel(),
+                            multiplicity=chunk_M,
                             **network_condition_kwargs,
                         ),
                     )
-                    atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+                    atom_coords_denoised.unflatten(0, (B_local, multiplicity))[:, sample_ids_chunk] = (
+                        atom_coords_denoised_chunk.unflatten(0, (B_local, chunk_M))
+                    )
 
                 if (
                     steering_args is not None
@@ -528,11 +574,12 @@ class AtomDiffusion(Module):
 
             if self.alignment_reverse_diff:
                 with torch.autocast("cuda", enabled=False):
+                    align_dtype = torch.promote_types(atom_coords_noisy.dtype, torch.float32)
                     atom_coords_noisy = weighted_rigid_align(
-                        atom_coords_noisy.float(),
-                        atom_coords_denoised.float(),
-                        atom_mask.float(),
-                        atom_mask.float(),
+                        atom_coords_noisy.to(align_dtype),
+                        atom_coords_denoised.to(align_dtype),
+                        atom_mask.to(align_dtype),
+                        atom_mask.to(align_dtype),
                     )
 
                 atom_coords_noisy = atom_coords_noisy.to(atom_coords_denoised)
@@ -544,7 +591,7 @@ class AtomDiffusion(Module):
 
             atom_coords = atom_coords_next
 
-        return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
+        return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr) # noqa: C408
 
     def loss_weight(self, sigma):
         return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)
@@ -592,20 +639,20 @@ class AtomDiffusion(Module):
         denoised_atom_coords = self.preconditioned_network_forward(
             noised_atom_coords,
             sigmas,
-            network_condition_kwargs={
-                "s_inputs": s_inputs,
-                "s_trunk": s_trunk,
-                "feats": feats,
-                "multiplicity": multiplicity,
-                "diffusion_conditioning": diffusion_conditioning,
-            },
+            network_condition_kwargs=dict( # noqa: C408
+                s_inputs=s_inputs,
+                s_trunk=s_trunk,
+                feats=feats,
+                multiplicity=multiplicity,
+                diffusion_conditioning=diffusion_conditioning,
+            ),
         )
 
-        return {
-            "denoised_atom_coords": denoised_atom_coords,
-            "sigmas": sigmas,
-            "aligned_true_atom_coords": atom_coords,
-        }
+        return dict( # noqa: C408
+            denoised_atom_coords=denoised_atom_coords,
+            sigmas=sigmas,
+            aligned_true_atom_coords=atom_coords,
+        )
 
     def compute_loss(
         self,
@@ -618,14 +665,15 @@ class AtomDiffusion(Module):
         filter_by_plddt=0.0,
     ):
         with torch.autocast("cuda", enabled=False):
-            denoised_atom_coords = out_dict["denoised_atom_coords"].float()
-            sigmas = out_dict["sigmas"].float()
+            compute_dtype = torch.promote_types(out_dict["denoised_atom_coords"].dtype, torch.float32)
+            denoised_atom_coords = out_dict["denoised_atom_coords"].to(compute_dtype)
+            sigmas = out_dict["sigmas"].to(compute_dtype)
 
-            resolved_atom_mask_uni = feats["atom_resolved_mask"].float()
+            resolved_atom_mask_uni = feats["atom_resolved_mask"].to(compute_dtype)
 
             if filter_by_plddt > 0:
                 plddt_mask = feats["plddt"] > filter_by_plddt
-                resolved_atom_mask_uni = resolved_atom_mask_uni * plddt_mask.float()
+                resolved_atom_mask_uni = resolved_atom_mask_uni * plddt_mask.to(compute_dtype)
 
             resolved_atom_mask = resolved_atom_mask_uni.repeat_interleave(
                 multiplicity, 0
@@ -636,8 +684,8 @@ class AtomDiffusion(Module):
             )
             atom_type = (
                 torch.bmm(
-                    feats["atom_to_token"].float(),
-                    feats["mol_type"].unsqueeze(-1).float(),
+                    feats["atom_to_token"].to(compute_dtype),
+                    feats["mol_type"].unsqueeze(-1).to(compute_dtype),
                 )
                 .squeeze(-1)
                 .long()
@@ -650,23 +698,23 @@ class AtomDiffusion(Module):
                     1
                     + nucleotide_loss_weight
                     * (
-                        torch.eq(atom_type_mult, const.chain_type_ids["DNA"]).float()
-                        + torch.eq(atom_type_mult, const.chain_type_ids["RNA"]).float()
+                        torch.eq(atom_type_mult, const.chain_type_ids["DNA"]).to(compute_dtype)
+                        + torch.eq(atom_type_mult, const.chain_type_ids["RNA"]).to(compute_dtype)
                     )
                     + ligand_loss_weight
                     * torch.eq(
                         atom_type_mult, const.chain_type_ids["NONPOLYMER"]
-                    ).float()
-                ).float()
+                    ).to(compute_dtype)
+                ).to(compute_dtype)
             )
 
-            atom_coords = out_dict["aligned_true_atom_coords"].float()
+            atom_coords = out_dict["aligned_true_atom_coords"].to(compute_dtype)
             atom_coords_aligned_ground_truth = weighted_rigid_align(
                 atom_coords.detach(),
                 denoised_atom_coords.detach(),
                 align_weights.detach(),
                 mask=feats["atom_resolved_mask"]
-                .float()
+                .to(compute_dtype)
                 .repeat_interleave(multiplicity, 0)
                 .detach(),
             )
@@ -696,8 +744,8 @@ class AtomDiffusion(Module):
                 lddt_loss = smooth_lddt_loss(
                     denoised_atom_coords,
                     feats["coords"],
-                    torch.eq(atom_type, const.chain_type_ids["DNA"]).float()
-                    + torch.eq(atom_type, const.chain_type_ids["RNA"]).float(),
+                    torch.eq(atom_type, const.chain_type_ids["DNA"]).to(compute_dtype)
+                    + torch.eq(atom_type, const.chain_type_ids["RNA"]).to(compute_dtype),
                     coords_mask=resolved_atom_mask_uni,
                     multiplicity=multiplicity,
                 )
@@ -709,4 +757,4 @@ class AtomDiffusion(Module):
                 "smooth_lddt_loss": lddt_loss,
             }
 
-        return {"loss": total_loss, "loss_breakdown": loss_breakdown}
+        return dict(loss=total_loss, loss_breakdown=loss_breakdown) # noqa: C408

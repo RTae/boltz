@@ -1,3 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+
 from collections import defaultdict
 from typing import Optional
 
@@ -57,10 +79,7 @@ class Validator(nn.Module):
             "disto_loss",
         ]
         self.folding_metrics = nn.ModuleDict(
-            {
-                k: nn.ModuleList([nn.ModuleDict() for _ in range(num_val_datasets)])
-                for k in folding_metric_labels
-            }
+            {k: nn.ModuleList([nn.ModuleDict() for _ in range(num_val_datasets)]) for k in folding_metric_labels}
         )
 
         self.physicalism_metrics = physicalism_metrics
@@ -97,19 +116,22 @@ class Validator(nn.Module):
             "avg",
         ]
         mae_metric_labels = ["plddt_mae", "pde_mae", "pae_mae"]
-        lddt_confidence_metric_labels = [
-            prefix + "_lddt" for prefix in confidence_metric_prefixes
-        ]
+        lddt_confidence_metric_labels = [prefix + "_lddt" for prefix in confidence_metric_prefixes]
         if physicalism_metrics:
-            clash_confidence_metric_labels = [
-                prefix + "_clash" for prefix in confidence_metric_prefixes
-            ]
-            pb_confidence_metric_labels = [
-                prefix + "_pb" for prefix in confidence_metric_prefixes
-            ]
+            clash_confidence_metric_labels = [prefix + "_clash" for prefix in confidence_metric_prefixes]
+            pb_confidence_metric_labels = [prefix + "_pb" for prefix in confidence_metric_prefixes]
         else:
             clash_confidence_metric_labels, pb_confidence_metric_labels = [], []
 
+        # All multi-sample metrics (both confidence-dependent and purely structural
+        # like avg_lddt, avg_clash, avg_pb) are stored in self.confidence_metrics.
+        # This ModuleDict is only created when confidence_prediction=True because
+        # most of its entries (top1_lddt, plddt_mae, pde_mae, etc.) require
+        # confidence module outputs (out["plddt"], out["complex_plddt"], etc.) for
+        # ranking or MAE computation.  The avg_* entries are purely structural
+        # (mean across diffusion samples) and don't need the confidence module,
+        # but are co-located here for convenience.  If avg_* metrics are needed
+        # without confidence_prediction, they would need a separate ModuleDict.
         if confidence_prediction:
             self.confidence_metrics = nn.ModuleDict(
                 {
@@ -128,11 +150,22 @@ class Validator(nn.Module):
                 "pocket_ligand_protein",
                 "contact_protein_protein",
             ]:
+                self.folding_metrics["lddt"][val_idx][m_] = MeanMetric()
                 self.folding_metrics["disto_lddt"][val_idx][m_] = MeanMetric()
+                self.folding_metrics["complex_lddt"][val_idx][m_] = MeanMetric()
 
             for m in const.out_single_types:
                 if confidence_prediction:
                     self.confidence_metrics["plddt_mae"][val_idx][m] = MeanMetric()
+
+            if confidence_prediction:
+                for m_ in const.out_types:
+                    if m_ == "modified":
+                        continue
+                    for k in lddt_confidence_metric_labels:
+                        self.confidence_metrics[k][val_idx][m_] = MeanMetric()
+                    self.confidence_metrics["pde_mae"][val_idx][m_] = MeanMetric()
+                    self.confidence_metrics["pae_mae"][val_idx][m_] = MeanMetric()
 
             for m in ["disto_loss"]:
                 self.folding_metrics["disto_loss"][val_idx][m] = MeanMetric()
@@ -171,9 +204,7 @@ class Validator(nn.Module):
             recycling_steps=model.validation_args.recycling_steps,
             num_sampling_steps=model.validation_args.sampling_steps,
             diffusion_samples=model.validation_args.diffusion_samples,
-            run_confidence_sequentially=model.validation_args.get(
-                "run_confidence_sequentially", False
-            ),
+            run_confidence_sequentially=model.validation_args.get("run_confidence_sequentially", False),
         )
 
         return out
@@ -226,9 +257,7 @@ class Validator(nn.Module):
     ) -> None:
         """Compute distogram loss."""
         # Compute validation disto loss
-        val_disto_loss, _ = distogram_loss(
-            out, batch, aggregate_distogram=model.aggregate_distogram
-        )
+        val_disto_loss, _ = distogram_loss(out, batch, aggregate_distogram=model.aggregate_distogram)
 
         return val_disto_loss
 
@@ -238,9 +267,7 @@ class Validator(nn.Module):
         lower = torch.tensor([1.0])
         upper = torch.tensor([model.max_dist + 5.0])
         exp_boundaries = torch.cat((lower, boundaries, upper))
-        mid_points = ((exp_boundaries[:-1] + exp_boundaries[1:]) / 2).to(
-            out["pdistogram"]
-        )
+        mid_points = ((exp_boundaries[:-1] + exp_boundaries[1:]) / 2).to(out["pdistogram"])
 
         # Compute true distogram
         K = batch["coords"].shape[1]
@@ -249,20 +276,14 @@ class Validator(nn.Module):
         batch["token_disto_mask"] = batch["token_disto_mask"]
 
         # Compute distogram lddt by looping over predicted distograms
-        disto_lddt_dict = defaultdict(
-            lambda: torch.zeros(K, model.num_distograms).to(model.device)
-        )
-        disto_total_dict = defaultdict(
-            lambda: torch.zeros(K, model.num_distograms).to(model.device)
-        )
+        disto_lddt_dict = defaultdict(lambda: torch.zeros(K, model.num_distograms).to(model.device))
+        disto_total_dict = defaultdict(lambda: torch.zeros(K, model.num_distograms).to(model.device))
         for i in range(model.num_distograms):
             # Compute predicted dists
             preds = out["pdistogram"][:, :, :, i]
             pred_softmax = torch.softmax(preds, dim=-1)
             pred_softmax = pred_softmax.argmax(dim=-1)
-            pred_softmax = torch.nn.functional.one_hot(
-                pred_softmax, num_classes=preds.shape[-1]
-            )
+            pred_softmax = torch.nn.functional.one_hot(pred_softmax, num_classes=preds.shape[-1])
             pred_dist_i = (pred_softmax * mid_points).sum(dim=-1)  # (B, L, L)
             del pred_softmax
 
@@ -271,9 +292,7 @@ class Validator(nn.Module):
             # conformers. Batched version over K factored_token_lddt_dist_loss_ensemble
             # more efficient for small K.
             for k in range(K):
-                true_dists_k = torch.cdist(true_center[k], true_center[k])[
-                    None
-                ]  # (1, L * L)
+                true_dists_k = torch.cdist(true_center[k], true_center[k])[None]  # (1, L * L)
 
                 # Compute lddt
                 disto_lddt_dict_, disto_total_dict_ = factored_token_lddt_dist_loss(
@@ -288,12 +307,8 @@ class Validator(nn.Module):
 
         for key in disto_lddt_dict:
             # Take min over distograms and average over conformers. Add batch dimension.
-            disto_lddt_dict[key] = (
-                disto_lddt_dict[key].min(dim=1).values.mean(dim=0)[None]
-            )
-            disto_total_dict[key] = (
-                disto_total_dict[key].min(dim=1).values.mean(dim=0)[None]
-            )
+            disto_lddt_dict[key] = disto_lddt_dict[key].min(dim=1).values.mean(dim=0)[None]
+            disto_total_dict[key] = disto_total_dict[key].min(dim=1).values.mean(dim=0)[None]
         del true_center
         del preds
 
@@ -332,9 +347,7 @@ class Validator(nn.Module):
         K = batch["coords"].shape[1]
 
         if not expand_to_diffusion_samples:
-            true_coords_resolved_mask = true_coords_resolved_mask.unsqueeze(0).repeat(
-                (n_samples, 1)
-            )
+            true_coords_resolved_mask = true_coords_resolved_mask.unsqueeze(0).repeat((n_samples, 1))
 
         ### Compute lddt ###
         # Implemented in a loop to avoid memory issues with large number
@@ -347,9 +360,7 @@ class Validator(nn.Module):
             if expand_to_diffusion_samples:
                 true_coords_k = true_coords[:, ensemble_idx]
             else:
-                true_coords_k = (
-                    true_coords[ensemble_idx].unsqueeze(0).repeat((n_samples, 1, 1))
-                )
+                true_coords_k = true_coords[ensemble_idx].unsqueeze(0).repeat((n_samples, 1, 1))
 
             all_lddt_dict_s, all_total_dict_s = factored_lddt_loss(
                 feats=batch,
@@ -363,9 +374,7 @@ class Validator(nn.Module):
                 all_total_dict[key].append(all_total_dict_s[key])
 
         for key in all_lddt_dict:
-            all_lddt_dict[key] = torch.stack(
-                all_lddt_dict[key], dim=1
-            )  # (multiplicity, K)
+            all_lddt_dict[key] = torch.stack(all_lddt_dict[key], dim=1)  # (multiplicity, K)
             all_total_dict[key] = torch.stack(all_total_dict[key], dim=1)
         return all_lddt_dict, all_total_dict
 
@@ -400,9 +409,7 @@ class Validator(nn.Module):
             num_chiral_atoms,
             num_stereo_bond_violations,
             num_stereo_bonds,
-        ) = compute_stereo_metrics(
-            pred_atom_coords=out["sample_atom_coords"], feats=batch
-        )
+        ) = compute_stereo_metrics(pred_atom_coords=out["sample_atom_coords"], feats=batch)
 
         (
             num_aromatic_5_violations,
@@ -411,9 +418,7 @@ class Validator(nn.Module):
             num_aromatic_6_rings,
             num_double_bond_violations,
             num_double_bonds,
-        ) = compute_pb_flatness_metrics(
-            pred_atom_coords=out["sample_atom_coords"], feats=batch
-        )
+        ) = compute_pb_flatness_metrics(pred_atom_coords=out["sample_atom_coords"], feats=batch)
 
         pb_failure_dict = {
             "bond_length": num_bond_length_failures,
@@ -465,17 +470,13 @@ class Validator(nn.Module):
 
         # All ensembles have same mask
         if not expand_to_diffusion_samples:
-            true_coords_resolved_mask = true_coords_resolved_mask.unsqueeze(0).repeat(
-                (n_samples, 1)
-            )
+            true_coords_resolved_mask = true_coords_resolved_mask.unsqueeze(0).repeat((n_samples, 1))
 
         for ensemble_idx in range(K):
             if expand_to_diffusion_samples:
                 true_coords_k = true_coords[:, ensemble_idx]
             else:
-                true_coords_k = (
-                    true_coords[ensemble_idx].unsqueeze(0).repeat((n_samples, 1, 1))
-                )
+                true_coords_k = true_coords[ensemble_idx].unsqueeze(0).repeat((n_samples, 1, 1))
 
             mae_plddt_dict, total_mae_plddt_dict = compute_plddt_mae(
                 pred_atom_coords=out["sample_atom_coords"],
@@ -483,7 +484,6 @@ class Validator(nn.Module):
                 true_atom_coords=true_coords_k,
                 pred_lddt=out["plddt"],
                 true_coords_resolved_mask=true_coords_resolved_mask,
-                token_level_confidence=model.token_level_confidence,
                 multiplicity=n_samples,
             )
             for key in mae_plddt_dict:
@@ -519,21 +519,15 @@ class Validator(nn.Module):
         # Take mean over ensembles
         for key in mae_plddt_dicts:
             mae_plddt_dicts[key] = torch.stack(mae_plddt_dicts[key], dim=0).mean(dim=0)
-            total_mae_plddt_dicts[key] = torch.stack(
-                total_mae_plddt_dicts[key], dim=0
-            ).mean(dim=0)
+            total_mae_plddt_dicts[key] = torch.stack(total_mae_plddt_dicts[key], dim=0).mean(dim=0)
 
         for key in mae_pde_dicts:
             mae_pde_dicts[key] = torch.stack(mae_pde_dicts[key], dim=0).mean(dim=0)
-            total_mae_pde_dicts[key] = torch.stack(
-                total_mae_pde_dicts[key], dim=0
-            ).mean(dim=0)
+            total_mae_pde_dicts[key] = torch.stack(total_mae_pde_dicts[key], dim=0).mean(dim=0)
 
         for key in mae_pae_dicts:
             mae_pae_dicts[key] = torch.stack(mae_pae_dicts[key], dim=0).mean(dim=0)
-            total_mae_pae_dicts[key] = torch.stack(
-                total_mae_pae_dicts[key], dim=0
-            ).mean(dim=0)
+            total_mae_pae_dicts[key] = torch.stack(total_mae_pae_dicts[key], dim=0).mean(dim=0)
 
         return (
             mae_plddt_dicts,
@@ -581,54 +575,38 @@ class Validator(nn.Module):
             if confidence_metric_name == "complex_plddt":
                 confidence_metric_prefix = "top1"
             elif "complex" in confidence_metric_name:
-                confidence_metric_prefix = (
-                    confidence_metric_name.split("_")[1] + "_top1"
-                )
+                confidence_metric_prefix = confidence_metric_name.split("_")[1] + "_top1"
             else:
                 confidence_metric_prefix = confidence_metric_name + "_top1"
             for key in all_lddt_dict:
                 if key == "modified":
                     continue
-                top1_val = (
-                    all_lddt_dict[key]
-                    .reshape(n_samples, K)[top1_idx, torch.arange(K)]
-                    .mean(dim=0)
+                top1_val = all_lddt_dict[key].reshape(n_samples, K)[top1_idx, torch.arange(K)].mean(dim=0)
+                top1_total = all_total_dict[key].reshape(n_samples, K)[top1_idx, torch.arange(K)].mean(dim=0)
+                self.confidence_metrics[confidence_metric_prefix + "_lddt"][idx_dataset][key].update(
+                    top1_val, top1_total
                 )
-                top1_total = (
-                    all_total_dict[key]
-                    .reshape(n_samples, K)[top1_idx, torch.arange(K)]
-                    .mean(dim=0)
-                )
-                self.confidence_metrics[confidence_metric_prefix + "_lddt"][
-                    idx_dataset
-                ][key].update(top1_val, top1_total)
 
             if physicalism_metrics:
                 for key in pair_clash_dict:
                     top1_val = pair_clash_dict[key][top1_idx]
                     top1_total = pair_total_dict[key][top1_idx]
-                    self.confidence_metrics[confidence_metric_prefix + "_clash"][
-                        idx_dataset
-                    ][key].update(top1_val, top1_total)
+                    self.confidence_metrics[confidence_metric_prefix + "_clash"][idx_dataset][key].update(
+                        top1_val, top1_total
+                    )
                 for key in pb_failure_dict:
                     top1_val = pb_failure_dict[key][top1_idx]
                     top1_total = pb_total_dict[key][top1_idx]
-                    self.confidence_metrics[confidence_metric_prefix + "_pb"][
-                        idx_dataset
-                    ][key].update(top1_val, top1_total)
+                    self.confidence_metrics[confidence_metric_prefix + "_pb"][idx_dataset][key].update(
+                        top1_val, top1_total
+                    )
 
         for key in all_lddt_dict:
             if key == "modified":
                 continue
-            self.confidence_metrics["avg_lddt"][idx_dataset][key].update(
-                all_lddt_dict[key], all_total_dict[key]
-            )
-            self.confidence_metrics["pde_mae"][idx_dataset][key].update(
-                mae_pde_dicts[key], total_mae_pde_dicts[key]
-            )
-            self.confidence_metrics["pae_mae"][idx_dataset][key].update(
-                mae_pae_dicts[key], total_mae_pae_dicts[key]
-            )
+            self.confidence_metrics["avg_lddt"][idx_dataset][key].update(all_lddt_dict[key], all_total_dict[key])
+            self.confidence_metrics["pde_mae"][idx_dataset][key].update(mae_pde_dicts[key], total_mae_pde_dicts[key])
+            self.confidence_metrics["pae_mae"][idx_dataset][key].update(mae_pae_dicts[key], total_mae_pae_dicts[key])
         for key in mae_plddt_dicts:
             self.confidence_metrics["plddt_mae"][idx_dataset][key].update(
                 mae_plddt_dicts[key], total_mae_plddt_dicts[key]
@@ -640,52 +618,84 @@ class Validator(nn.Module):
                     pair_clash_dict[key], pair_total_dict[key]
                 )
             for key in pb_failure_dict:
-                self.confidence_metrics["avg_pb"][idx_dataset][key].update(
-                    pb_failure_dict[key], pb_total_dict[key]
-                )
+                self.confidence_metrics["avg_pb"][idx_dataset][key].update(pb_failure_dict[key], pb_total_dict[key])
 
     def update_lddt_rmsd_metrics(
         self,
         batch,
+        all_lddt_dict,
+        all_total_dict,
         disto_lddt_dict,
         disto_total_dict,
         idx_dataset,
-        return_dict,
     ):
+        any_key = next(iter(all_lddt_dict))
+        n_samples = all_lddt_dict[any_key].shape[0]
+        K = batch["coords"].shape[1]
+
+        if n_samples > 1:
+            complex_total = 0
+            complex_lddt = 0
+            for key in all_lddt_dict:
+                if key == "modified":
+                    continue
+                complex_lddt += all_lddt_dict[key] * all_total_dict[key]
+                complex_total += all_total_dict[key]
+            complex_lddt /= complex_total + 1e-7
+            best_complex_idx = complex_lddt.reshape(n_samples, K).argmax(dim=0)
+
+            best_lddt_dict = {}
+            best_total_dict = {}
+            best_complex_lddt_dict = {}
+            best_complex_total_dict = {}
+            conformer_idx = torch.arange(K, device=batch["coords"].device)
+            for key in all_lddt_dict:
+                lddt_values = all_lddt_dict[key].reshape(n_samples, K)
+                total_values = all_total_dict[key].reshape(n_samples, K)
+                best_idx = lddt_values.argmax(dim=0)
+                best_lddt_dict[key] = lddt_values[best_idx, conformer_idx]
+                best_total_dict[key] = total_values[best_idx, conformer_idx]
+                best_complex_lddt_dict[key] = lddt_values[best_complex_idx, conformer_idx]
+                best_complex_total_dict[key] = total_values[best_complex_idx, conformer_idx]
+        else:
+            best_lddt_dict = all_lddt_dict
+            best_total_dict = all_total_dict
+            best_complex_lddt_dict = all_lddt_dict
+            best_complex_total_dict = all_total_dict
+
         # Folding metrics
         for m_ in const.out_types:
+            target_m = m_
             if m_ == "ligand_protein":
                 if torch.any(
-                    batch["contact_conditioning"][
-                        :, :, :, const.contact_conditioning_info["BINDER>POCKET"]
-                    ].bool()
+                    batch["contact_conditioning"][:, :, :, const.contact_conditioning_info["BINDER>POCKET"]].bool()
                 ):
-                    self.folding_metrics["disto_lddt"][idx_dataset][
-                        "pocket_ligand_protein"
-                    ].update(disto_lddt_dict[m_], disto_total_dict[m_])
+                    target_m = "pocket_ligand_protein"
                 else:
-                    self.folding_metrics["disto_lddt"][idx_dataset][
-                        "ligand_protein"
-                    ].update(disto_lddt_dict[m_], disto_total_dict[m_])
+                    target_m = "ligand_protein"
 
             elif m_ == "protein_protein":
-                if torch.any(
-                    batch["contact_conditioning"][
-                        :, :, :, const.contact_conditioning_info["CONTACT"]
-                    ].bool()
-                ):
-                    self.folding_metrics["disto_lddt"][idx_dataset][
-                        "contact_protein_protein"
-                    ].update(disto_lddt_dict[m_], disto_total_dict[m_])
+                if torch.any(batch["contact_conditioning"][:, :, :, const.contact_conditioning_info["CONTACT"]].bool()):
+                    target_m = "contact_protein_protein"
                 else:
-                    self.folding_metrics["disto_lddt"][idx_dataset][
-                        "protein_protein"
-                    ].update(disto_lddt_dict[m_], disto_total_dict[m_])
+                    target_m = "protein_protein"
 
-            else:
-                self.folding_metrics["disto_lddt"][idx_dataset][m_].update(
-                    disto_lddt_dict[m_], disto_total_dict[m_]
-                )
+            if (
+                m_ not in best_lddt_dict
+                or m_ not in best_total_dict
+                or m_ not in disto_lddt_dict
+                or m_ not in disto_total_dict
+                or m_ not in best_complex_lddt_dict
+                or m_ not in best_complex_total_dict
+            ):
+                # Some classes (e.g. modified) may be absent for a batch.
+                continue
+
+            self.folding_metrics["lddt"][idx_dataset][target_m].update(best_lddt_dict[m_], best_total_dict[m_])
+            self.folding_metrics["disto_lddt"][idx_dataset][target_m].update(disto_lddt_dict[m_], disto_total_dict[m_])
+            self.folding_metrics["complex_lddt"][idx_dataset][target_m].update(
+                best_complex_lddt_dict[m_], best_complex_total_dict[m_]
+            )
 
     def update_physcialism_metrics(
         self,
@@ -696,14 +706,10 @@ class Validator(nn.Module):
         idx_dataset,
     ):
         for key in pair_clash_dict:
-            self.physicalism_metrics["clash"][idx_dataset][key].update(
-                pair_clash_dict[key], pair_total_dict[key]
-            )
+            self.physicalism_metrics["clash"][idx_dataset][key].update(pair_clash_dict[key], pair_total_dict[key])
 
         for key in pb_failure_dict:
-            self.physicalism_metrics["pb"][idx_dataset][key].update(
-                pb_failure_dict[key], pb_total_dict[key]
-            )
+            self.physicalism_metrics["pb"][idx_dataset][key].update(pb_failure_dict[key], pb_total_dict[key])
 
     def common_val_step(
         self,
@@ -724,9 +730,7 @@ class Validator(nn.Module):
         out : dict[str, torch.Tensor]
             The output of the model.
         """
-        symmetry_correction = model.val_group_mapper[idx_dataset][
-            "symmetry_correction"
-        ]  # global val index
+        symmetry_correction = model.val_group_mapper[idx_dataset]["symmetry_correction"]  # global val index
 
         # Get the local validation index from the global index
         idx_dataset = self.get_local_val_index(model, idx_dataset)
@@ -737,9 +741,7 @@ class Validator(nn.Module):
         val_disto_loss = self.compute_disto_loss(model, out, batch, idx_dataset)
 
         # Compute distogram lddt and update metrics
-        disto_lddt_dict, disto_total_dict = self.compute_disto_lddt(
-            model, batch, out, idx_dataset
-        )
+        disto_lddt_dict, disto_total_dict = self.compute_disto_lddt(model, batch, out, idx_dataset)
 
         # Get true coords
         return_dict = self.get_true_coords(
@@ -786,7 +788,14 @@ class Validator(nn.Module):
             pair_clash_dict, pair_total_dict = None, None
             pb_failure_dict, pb_total_dict = None, None
 
-        # Filtering based on confidence
+        # Gated on confidence_prediction because get_confidence_metrics reads
+        # out["plddt"], out["pde"], out["pae"] which only exist when the
+        # confidence module runs.  Also gated on n_samples > 1 because ranking
+        # and averaging across samples is trivial with a single sample.
+        # Note: avg_lddt/avg_clash/avg_pb within update_confidence_metrics are
+        # purely structural and don't need the confidence module, but are stored
+        # in self.confidence_metrics which only exists when confidence_prediction
+        # is True (see __init__).
         if model.confidence_prediction and n_samples > 1:
             (
                 mae_plddt_dicts,
@@ -807,17 +816,16 @@ class Validator(nn.Module):
             )
 
         # Update distogram loss
-        self.folding_metrics["disto_loss"][idx_dataset]["disto_loss"].update(
-            val_disto_loss
-        )
+        self.folding_metrics["disto_loss"][idx_dataset]["disto_loss"].update(val_disto_loss)
 
         # Update folding metrics
         self.update_lddt_rmsd_metrics(
             batch,
+            all_lddt_dict,
+            all_total_dict,
             disto_lddt_dict,
             disto_total_dict,
             idx_dataset,
-            return_dict,
         )
 
         # Update physcial realism metrics
@@ -886,9 +894,7 @@ class Validator(nn.Module):
             avg_protein_iptm_top1_pb = [{} for _ in range(self.num_val_datasets)]
 
         for idx_dataset in range(self.num_val_datasets):  # local idx_dataset
-            dataset_name_ori = self.val_names[
-                idx_dataset
-            ]  # self.val_group_mapper[idx_dataset]["label"]
+            dataset_name_ori = self.val_names[idx_dataset]  # self.val_group_mapper[idx_dataset]["label"]
 
             # TODO this is harcodeded for now to compare with Boltz-1 metrics
             dataset_name = "" if dataset_name_ori == "RCSB" else f"__{dataset_name_ori}"
@@ -898,14 +904,20 @@ class Validator(nn.Module):
                 "pocket_ligand_protein",
                 "contact_protein_protein",
             ]:
-                avg_disto_lddt[idx_dataset][m_] = self.folding_metrics["disto_lddt"][
-                    idx_dataset
-                ][m_].compute()
+                avg_lddt[idx_dataset][m_] = self.folding_metrics["lddt"][idx_dataset][m_].compute()
+                avg_lddt[idx_dataset][m_] = (
+                    0.0 if torch.isnan(avg_lddt[idx_dataset][m_]) else avg_lddt[idx_dataset][m_].item()
+                )
+                self.folding_metrics["lddt"][idx_dataset][m_].reset()
+                model.log(
+                    f"val/lddt_{m_}{dataset_name}",
+                    avg_lddt[idx_dataset][m_],
+                )
+
+                avg_disto_lddt[idx_dataset][m_] = self.folding_metrics["disto_lddt"][idx_dataset][m_].compute()
 
                 avg_disto_lddt[idx_dataset][m_] = (
-                    0.0
-                    if torch.isnan(avg_disto_lddt[idx_dataset][m_])
-                    else avg_disto_lddt[idx_dataset][m_].item()
+                    0.0 if torch.isnan(avg_disto_lddt[idx_dataset][m_]) else avg_disto_lddt[idx_dataset][m_].item()
                 )
                 self.folding_metrics["disto_lddt"][idx_dataset][m_].reset()
                 model.log(
@@ -913,26 +925,74 @@ class Validator(nn.Module):
                     avg_disto_lddt[idx_dataset][m_],
                 )
 
+                avg_complex_lddt[idx_dataset][m_] = self.folding_metrics["complex_lddt"][idx_dataset][m_].compute()
+                avg_complex_lddt[idx_dataset][m_] = (
+                    0.0 if torch.isnan(avg_complex_lddt[idx_dataset][m_]) else avg_complex_lddt[idx_dataset][m_].item()
+                )
+                self.folding_metrics["complex_lddt"][idx_dataset][m_].reset()
+                model.log(
+                    f"val/complex_lddt_{m_}{dataset_name}",
+                    avg_complex_lddt[idx_dataset][m_],
+                )
+
             for m in const.out_single_types:
                 if model.confidence_prediction:
-                    avg_mae_plddt[idx_dataset][m] = (
-                        self.confidence_metrics["plddt_mae"][idx_dataset][m]
-                        .compute()
-                        .item()
-                    )
+                    val = self.confidence_metrics["plddt_mae"][idx_dataset][m].compute()
+                    avg_mae_plddt[idx_dataset][m] = 0.0 if torch.isnan(val) else val.item()
                     self.confidence_metrics["plddt_mae"][idx_dataset][m].reset()
                     model.log(
                         f"val/MAE_plddt_{m}{dataset_name}",
                         avg_mae_plddt[idx_dataset][m],
                     )
 
+            if model.confidence_prediction:
+                confidence_pair_keys = [m_ for m_ in const.out_types if m_ != "modified"]
+                for m_ in confidence_pair_keys:
+                    for prefix in [
+                        "top1",
+                        "iplddt_top1",
+                        "ipde_top1",
+                        "pde_top1",
+                        "ptm_top1",
+                        "iptm_top1",
+                        "ligand_iptm_top1",
+                        "protein_iptm_top1",
+                        "avg",
+                    ]:
+                        label = f"{prefix}_lddt"
+                        val = self.confidence_metrics[label][idx_dataset][m_].compute()
+                        val = 0.0 if torch.isnan(val) else val.item()
+                        self.confidence_metrics[label][idx_dataset][m_].reset()
+                        model.log(f"val/{label}_{m_}{dataset_name}", val)
+
+                    for mae_label, log_prefix in [("pde_mae", "MAE_pde"), ("pae_mae", "MAE_pae")]:
+                        val = self.confidence_metrics[mae_label][idx_dataset][m_].compute()
+                        val = 0.0 if torch.isnan(val) else val.item()
+                        self.confidence_metrics[mae_label][idx_dataset][m_].reset()
+                        model.log(f"val/{log_prefix}_{m_}{dataset_name}", val)
+
             overall_disto_lddt = sum(
-                avg_disto_lddt[idx_dataset][m] * w
-                for (m, w) in const.out_types_weights.items()
+                avg_disto_lddt[idx_dataset][m] * w for (m, w) in const.out_types_weights.items()
             ) / sum(const.out_types_weights.values())
             model.log(
                 f"val/disto_lddt{dataset_name}",
                 overall_disto_lddt,
+            )
+
+            overall_lddt = sum(avg_lddt[idx_dataset][m] * w for (m, w) in const.out_types_weights.items()) / sum(
+                const.out_types_weights.values()
+            )
+            model.log(
+                f"val/lddt{dataset_name}",
+                overall_lddt,
+            )
+
+            overall_complex_lddt = sum(
+                avg_complex_lddt[idx_dataset][m] * w for (m, w) in const.out_types_weights.items()
+            ) / sum(const.out_types_weights.values())
+            model.log(
+                f"val/complex_lddt{dataset_name}",
+                overall_complex_lddt,
             )
 
             # Distogram loss
@@ -942,16 +1002,10 @@ class Validator(nn.Module):
 
             # Physical realism metrics
             if self.physicalism_metrics:
-                for m in ["asym_" + m_ for m_ in const.clash_types] + [
-                    "sym_" + m_ for m_ in const.out_single_types
-                ]:
-                    avg_clash[idx_dataset][m] = self.physicalism_metrics["clash"][
-                        idx_dataset
-                    ][m].compute()
+                for m in ["asym_" + m_ for m_ in const.clash_types] + ["sym_" + m_ for m_ in const.out_single_types]:
+                    avg_clash[idx_dataset][m] = self.physicalism_metrics["clash"][idx_dataset][m].compute()
                     avg_clash[idx_dataset][m] = (
-                        0.0
-                        if torch.isnan(avg_clash[idx_dataset][m])
-                        else avg_clash[idx_dataset][m].item()
+                        0.0 if torch.isnan(avg_clash[idx_dataset][m]) else avg_clash[idx_dataset][m].item()
                     )
                     self.physicalism_metrics["clash"][idx_dataset][m].reset()
                     model.log(
@@ -960,9 +1014,7 @@ class Validator(nn.Module):
                     )
 
                     if model.confidence_prediction:
-                        avg_top1_clash[idx_dataset][m] = self.confidence_metrics[
-                            "top1_clash"
-                        ][idx_dataset][m].compute()
+                        avg_top1_clash[idx_dataset][m] = self.confidence_metrics["top1_clash"][idx_dataset][m].compute()
                         avg_top1_clash[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_top1_clash[idx_dataset][m])
@@ -974,129 +1026,107 @@ class Validator(nn.Module):
                             avg_top1_clash[idx_dataset][m],
                         )
 
-                        avg_iplddt_top1_clash[idx_dataset][m] = self.confidence_metrics[
-                            "iplddt_top1_clash"
-                        ][idx_dataset][m].compute()
+                        avg_iplddt_top1_clash[idx_dataset][m] = self.confidence_metrics["iplddt_top1_clash"][
+                            idx_dataset
+                        ][m].compute()
                         avg_iplddt_top1_clash[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_iplddt_top1_clash[idx_dataset][m])
                             else avg_iplddt_top1_clash[idx_dataset][m].item()
                         )
-                        self.confidence_metrics["iplddt_top1_clash"][idx_dataset][
-                            m
-                        ].reset()
+                        self.confidence_metrics["iplddt_top1_clash"][idx_dataset][m].reset()
                         model.log(
                             f"val/iplddt_top1_clash_{m}{dataset_name}",
                             avg_iplddt_top1_clash[idx_dataset][m],
                         )
 
-                        avg_pde_top1_clash[idx_dataset][m] = self.confidence_metrics[
-                            "pde_top1_clash"
-                        ][idx_dataset][m].compute()
+                        avg_pde_top1_clash[idx_dataset][m] = self.confidence_metrics["pde_top1_clash"][idx_dataset][
+                            m
+                        ].compute()
                         avg_pde_top1_clash[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_pde_top1_clash[idx_dataset][m])
                             else avg_pde_top1_clash[idx_dataset][m].item()
                         )
-                        self.confidence_metrics["pde_top1_clash"][idx_dataset][
-                            m
-                        ].reset()
+                        self.confidence_metrics["pde_top1_clash"][idx_dataset][m].reset()
                         model.log(
                             f"val/pde_top1_clash_{m}{dataset_name}",
                             avg_pde_top1_clash[idx_dataset][m],
                         )
 
-                        avg_ipde_top1_clash[idx_dataset][m] = self.confidence_metrics[
-                            "ipde_top1_clash"
-                        ][idx_dataset][m].compute()
+                        avg_ipde_top1_clash[idx_dataset][m] = self.confidence_metrics["ipde_top1_clash"][idx_dataset][
+                            m
+                        ].compute()
                         avg_ipde_top1_clash[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_ipde_top1_clash[idx_dataset][m])
                             else avg_ipde_top1_clash[idx_dataset][m].item()
                         )
-                        self.confidence_metrics["ipde_top1_clash"][idx_dataset][
-                            m
-                        ].reset()
+                        self.confidence_metrics["ipde_top1_clash"][idx_dataset][m].reset()
                         model.log(
                             f"val/ipde_top1_clash_{m}{dataset_name}",
                             avg_ipde_top1_clash[idx_dataset][m],
                         )
 
-                        avg_ptm_top1_clash[idx_dataset][m] = self.confidence_metrics[
-                            "ptm_top1_clash"
-                        ][idx_dataset][m].compute()
+                        avg_ptm_top1_clash[idx_dataset][m] = self.confidence_metrics["ptm_top1_clash"][idx_dataset][
+                            m
+                        ].compute()
                         avg_ptm_top1_clash[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_ptm_top1_clash[idx_dataset][m])
                             else avg_ptm_top1_clash[idx_dataset][m].item()
                         )
-                        self.confidence_metrics["ptm_top1_clash"][idx_dataset][
-                            m
-                        ].reset()
+                        self.confidence_metrics["ptm_top1_clash"][idx_dataset][m].reset()
                         model.log(
                             f"val/ptm_top1_clash_{m}{dataset_name}",
                             avg_ptm_top1_clash[idx_dataset][m],
                         )
 
-                        avg_iptm_top1_clash[idx_dataset][m] = self.confidence_metrics[
-                            "iptm_top1_clash"
-                        ][idx_dataset][m].compute()
+                        avg_iptm_top1_clash[idx_dataset][m] = self.confidence_metrics["iptm_top1_clash"][idx_dataset][
+                            m
+                        ].compute()
                         avg_iptm_top1_clash[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_iptm_top1_clash[idx_dataset][m])
                             else avg_iptm_top1_clash[idx_dataset][m].item()
                         )
-                        self.confidence_metrics["iptm_top1_clash"][idx_dataset][
-                            m
-                        ].reset()
+                        self.confidence_metrics["iptm_top1_clash"][idx_dataset][m].reset()
                         model.log(
                             f"val/iptm_top1_clash_{m}{dataset_name}",
                             avg_iptm_top1_clash[idx_dataset][m],
                         )
 
-                        avg_ligand_iptm_top1_clash[idx_dataset][m] = (
-                            self.confidence_metrics["ligand_iptm_top1_clash"][
-                                idx_dataset
-                            ][m].compute()
-                        )
+                        avg_ligand_iptm_top1_clash[idx_dataset][m] = self.confidence_metrics["ligand_iptm_top1_clash"][
+                            idx_dataset
+                        ][m].compute()
                         avg_ligand_iptm_top1_clash[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_ligand_iptm_top1_clash[idx_dataset][m])
                             else avg_ligand_iptm_top1_clash[idx_dataset][m].item()
                         )
-                        self.confidence_metrics["ligand_iptm_top1_clash"][idx_dataset][
-                            m
-                        ].reset()
+                        self.confidence_metrics["ligand_iptm_top1_clash"][idx_dataset][m].reset()
                         model.log(
                             f"val/ligand_iptm_top1_clash_{m}{dataset_name}",
                             avg_ligand_iptm_top1_clash[idx_dataset][m],
                         )
 
-                        avg_protein_iptm_top1_clash[idx_dataset][m] = (
-                            self.confidence_metrics["protein_iptm_top1_clash"][
-                                idx_dataset
-                            ][m].compute()
-                        )
+                        avg_protein_iptm_top1_clash[idx_dataset][m] = self.confidence_metrics[
+                            "protein_iptm_top1_clash"
+                        ][idx_dataset][m].compute()
                         avg_protein_iptm_top1_clash[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_protein_iptm_top1_clash[idx_dataset][m])
                             else avg_protein_iptm_top1_clash[idx_dataset][m].item()
                         )
-                        self.confidence_metrics["protein_iptm_top1_clash"][idx_dataset][
-                            m
-                        ].reset()
+                        self.confidence_metrics["protein_iptm_top1_clash"][idx_dataset][m].reset()
                         model.log(
                             f"val/protein_iptm_top1_clash_{m}{dataset_name}",
                             avg_protein_iptm_top1_clash[idx_dataset][m],
                         )
 
-                        avg_avg_clash[idx_dataset][m] = self.confidence_metrics[
-                            "avg_clash"
-                        ][idx_dataset][m].compute()
+                        avg_avg_clash[idx_dataset][m] = self.confidence_metrics["avg_clash"][idx_dataset][m].compute()
                         avg_avg_clash[idx_dataset][m] = (
-                            0.0
-                            if torch.isnan(avg_avg_clash[idx_dataset][m])
-                            else avg_avg_clash[idx_dataset][m].item()
+                            0.0 if torch.isnan(avg_avg_clash[idx_dataset][m]) else avg_avg_clash[idx_dataset][m].item()
                         )
                         self.confidence_metrics["avg_clash"][idx_dataset][m].reset()
                         model.log(
@@ -1114,13 +1144,9 @@ class Validator(nn.Module):
                     "ring_6_flatness",
                     "double_bond_flatness",
                 ]:
-                    avg_pb[idx_dataset][m] = self.physicalism_metrics["pb"][
-                        idx_dataset
-                    ][m].compute()
+                    avg_pb[idx_dataset][m] = self.physicalism_metrics["pb"][idx_dataset][m].compute()
                     avg_pb[idx_dataset][m] = (
-                        0.0
-                        if torch.isnan(avg_pb[idx_dataset][m])
-                        else avg_pb[idx_dataset][m].item()
+                        0.0 if torch.isnan(avg_pb[idx_dataset][m]) else avg_pb[idx_dataset][m].item()
                     )
                     self.physicalism_metrics["pb"][idx_dataset][m].reset()
                     model.log(
@@ -1129,13 +1155,9 @@ class Validator(nn.Module):
                     )
 
                     if model.confidence_prediction:
-                        avg_top1_pb[idx_dataset][m] = self.confidence_metrics[
-                            "top1_pb"
-                        ][idx_dataset][m].compute()
+                        avg_top1_pb[idx_dataset][m] = self.confidence_metrics["top1_pb"][idx_dataset][m].compute()
                         avg_top1_pb[idx_dataset][m] = (
-                            0.0
-                            if torch.isnan(avg_top1_pb[idx_dataset][m])
-                            else avg_top1_pb[idx_dataset][m].item()
+                            0.0 if torch.isnan(avg_top1_pb[idx_dataset][m]) else avg_top1_pb[idx_dataset][m].item()
                         )
                         self.confidence_metrics["top1_pb"][idx_dataset][m].reset()
                         model.log(
@@ -1143,25 +1165,23 @@ class Validator(nn.Module):
                             avg_top1_pb[idx_dataset][m],
                         )
 
-                        avg_iplddt_top1_pb[idx_dataset][m] = self.confidence_metrics[
-                            "iplddt_top1_pb"
-                        ][idx_dataset][m].compute()
+                        avg_iplddt_top1_pb[idx_dataset][m] = self.confidence_metrics["iplddt_top1_pb"][idx_dataset][
+                            m
+                        ].compute()
                         avg_iplddt_top1_pb[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_iplddt_top1_pb[idx_dataset][m])
                             else avg_iplddt_top1_pb[idx_dataset][m].item()
                         )
-                        self.confidence_metrics["iplddt_top1_pb"][idx_dataset][
-                            m
-                        ].reset()
+                        self.confidence_metrics["iplddt_top1_pb"][idx_dataset][m].reset()
                         model.log(
                             f"val/iplddt_top1_pb_{m}{dataset_name}",
                             avg_iplddt_top1_pb[idx_dataset][m],
                         )
 
-                        avg_pde_top1_pb[idx_dataset][m] = self.confidence_metrics[
-                            "pde_top1_pb"
-                        ][idx_dataset][m].compute()
+                        avg_pde_top1_pb[idx_dataset][m] = self.confidence_metrics["pde_top1_pb"][idx_dataset][
+                            m
+                        ].compute()
                         avg_pde_top1_pb[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_pde_top1_pb[idx_dataset][m])
@@ -1173,9 +1193,9 @@ class Validator(nn.Module):
                             avg_pde_top1_pb[idx_dataset][m],
                         )
 
-                        avg_ipde_top1_pb[idx_dataset][m] = self.confidence_metrics[
-                            "ipde_top1_pb"
-                        ][idx_dataset][m].compute()
+                        avg_ipde_top1_pb[idx_dataset][m] = self.confidence_metrics["ipde_top1_pb"][idx_dataset][
+                            m
+                        ].compute()
                         avg_ipde_top1_pb[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_ipde_top1_pb[idx_dataset][m])
@@ -1187,9 +1207,9 @@ class Validator(nn.Module):
                             avg_ipde_top1_pb[idx_dataset][m],
                         )
 
-                        avg_ptm_top1_pb[idx_dataset][m] = self.confidence_metrics[
-                            "ptm_top1_pb"
-                        ][idx_dataset][m].compute()
+                        avg_ptm_top1_pb[idx_dataset][m] = self.confidence_metrics["ptm_top1_pb"][idx_dataset][
+                            m
+                        ].compute()
                         avg_ptm_top1_pb[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_ptm_top1_pb[idx_dataset][m])
@@ -1201,9 +1221,9 @@ class Validator(nn.Module):
                             avg_ptm_top1_pb[idx_dataset][m],
                         )
 
-                        avg_iptm_top1_pb[idx_dataset][m] = self.confidence_metrics[
-                            "iptm_top1_pb"
-                        ][idx_dataset][m].compute()
+                        avg_iptm_top1_pb[idx_dataset][m] = self.confidence_metrics["iptm_top1_pb"][idx_dataset][
+                            m
+                        ].compute()
                         avg_iptm_top1_pb[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_iptm_top1_pb[idx_dataset][m])
@@ -1215,49 +1235,37 @@ class Validator(nn.Module):
                             avg_iptm_top1_pb[idx_dataset][m],
                         )
 
-                        avg_ligand_iptm_top1_pb[idx_dataset][m] = (
-                            self.confidence_metrics["ligand_iptm_top1_pb"][idx_dataset][
-                                m
-                            ].compute()
-                        )
+                        avg_ligand_iptm_top1_pb[idx_dataset][m] = self.confidence_metrics["ligand_iptm_top1_pb"][
+                            idx_dataset
+                        ][m].compute()
                         avg_ligand_iptm_top1_pb[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_ligand_iptm_top1_pb[idx_dataset][m])
                             else avg_ligand_iptm_top1_pb[idx_dataset][m].item()
                         )
-                        self.confidence_metrics["ligand_iptm_top1_pb"][idx_dataset][
-                            m
-                        ].reset()
+                        self.confidence_metrics["ligand_iptm_top1_pb"][idx_dataset][m].reset()
                         model.log(
                             f"val/ligand_iptm_top1_pb_{m}{dataset_name}",
                             avg_ligand_iptm_top1_pb[idx_dataset][m],
                         )
 
-                        avg_protein_iptm_top1_pb[idx_dataset][m] = (
-                            self.confidence_metrics["protein_iptm_top1_pb"][
-                                idx_dataset
-                            ][m].compute()
-                        )
+                        avg_protein_iptm_top1_pb[idx_dataset][m] = self.confidence_metrics["protein_iptm_top1_pb"][
+                            idx_dataset
+                        ][m].compute()
                         avg_protein_iptm_top1_pb[idx_dataset][m] = (
                             0.0
                             if torch.isnan(avg_protein_iptm_top1_pb[idx_dataset][m])
                             else avg_protein_iptm_top1_pb[idx_dataset][m].item()
                         )
-                        self.confidence_metrics["protein_iptm_top1_pb"][idx_dataset][
-                            m
-                        ].reset()
+                        self.confidence_metrics["protein_iptm_top1_pb"][idx_dataset][m].reset()
                         model.log(
                             f"val/protein_iptm_top1_pb_{m}{dataset_name}",
                             avg_protein_iptm_top1_pb[idx_dataset][m],
                         )
 
-                        avg_avg_pb[idx_dataset][m] = self.confidence_metrics["avg_pb"][
-                            idx_dataset
-                        ][m].compute()
+                        avg_avg_pb[idx_dataset][m] = self.confidence_metrics["avg_pb"][idx_dataset][m].compute()
                         avg_avg_pb[idx_dataset][m] = (
-                            0.0
-                            if torch.isnan(avg_avg_pb[idx_dataset][m])
-                            else avg_avg_pb[idx_dataset][m].item()
+                            0.0 if torch.isnan(avg_avg_pb[idx_dataset][m]) else avg_avg_pb[idx_dataset][m].item()
                         )
                         self.confidence_metrics["avg_pb"][idx_dataset][m].reset()
                         model.log(

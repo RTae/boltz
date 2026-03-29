@@ -1,3 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# fmt: off
+
 import multiprocessing
 import os
 import pickle
@@ -1035,6 +1058,13 @@ def cli() -> None:
     is_flag=True,
     help=" to dump the s and z embeddings into a npz file. Default is False.",
 )
+@click.option(
+    "--input_format",
+    type=click.Choice(["preprocessed", "config_files"], case_sensitive=False),
+    help="Data format for input. If 'config_files', expects a yaml, fasta, or directory containing multiple of those."
+    "If preprocessed, expects a folder with manifest.json, msa/ folder and structures/ folder with preprocessed data.",
+    default="config_files",
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1073,6 +1103,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
     write_embeddings: bool = False,
+    input_format: str = "config_files",
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1139,69 +1170,77 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         msg = f"Model {model} not supported. Supported: boltz1, boltz2."
         raise ValueError(f"Model {model} not supported.")
 
-    # Validate inputs
-    data = check_inputs(data)
-
-    # Check method
-    if method is not None:
-        if model == "boltz1":
-            msg = "Method conditioning is not supported for Boltz-1."
-            raise ValueError(msg)
-        if method.lower() not in const.method_types_ids:
-            method_names = list(const.method_types_ids.keys())
-            msg = f"Method {method} not supported. Supported: {method_names}"
-            raise ValueError(msg)
-
-    # Process inputs
-    ccd_path = cache / "ccd.pkl"
     mol_dir = cache / "mols"
-    process_inputs(
-        data=data,
-        out_dir=out_dir,
-        ccd_path=ccd_path,
-        mol_dir=mol_dir,
-        use_msa_server=use_msa_server,
-        msa_server_url=msa_server_url,
-        msa_pairing_strategy=msa_pairing_strategy,
-        msa_server_username=msa_server_username,
-        msa_server_password=msa_server_password,
-        api_key_header=api_key_header,
-        api_key_value=api_key_value,
-        boltz2=model == "boltz2",
-        preprocessing_threads=preprocessing_threads,
-        max_msa_seqs=max_msa_seqs,
-    )
 
-    # Load manifest
-    manifest = Manifest.load(out_dir / "processed" / "manifest.json")
+    if input_format == "preprocessed":
+        processed_dir = data
+        manifest = Manifest.load(processed_dir / "manifest.json")
+        filtered_manifest = filter_inputs_structure(
+            manifest=manifest,
+            outdir=out_dir,
+            override=override,
+        )
+        processed = BoltzProcessedInput(
+            manifest=filtered_manifest,
+            targets_dir=processed_dir / "structures",
+            msa_dir=processed_dir / "msa",
+            constraints_dir=((processed_dir / "constraints") if (processed_dir / "constraints").exists() else None),
+            template_dir=((processed_dir / "templates") if (processed_dir / "templates").exists() else None),
+            extra_mols_dir=((processed_dir / "extra_mols") if (processed_dir / "extra_mols").exists() else None),
+        )
+    else:
+        # Validate inputs
+        data = check_inputs(data)
 
-    # Filter out existing predictions
-    filtered_manifest = filter_inputs_structure(
-        manifest=manifest,
-        outdir=out_dir,
-        override=override,
-    )
+        # Check method
+        if method is not None:
+            if model == "boltz1":
+                msg = "Method conditioning is not supported for Boltz-1."
+                raise ValueError(msg)
+            if method.lower() not in const.method_types_ids:
+                method_names = list(const.method_types_ids.keys())
+                msg = f"Method {method} not supported. Supported: {method_names}"
+                raise ValueError(msg)
 
-    # Load processed data
-    processed_dir = out_dir / "processed"
-    processed = BoltzProcessedInput(
-        manifest=filtered_manifest,
-        targets_dir=processed_dir / "structures",
-        msa_dir=processed_dir / "msa",
-        constraints_dir=(
-            (processed_dir / "constraints")
-            if (processed_dir / "constraints").exists()
-            else None
-        ),
-        template_dir=(
-            (processed_dir / "templates")
-            if (processed_dir / "templates").exists()
-            else None
-        ),
-        extra_mols_dir=(
-            (processed_dir / "mols") if (processed_dir / "mols").exists() else None
-        ),
-    )
+        # Process inputs
+        ccd_path = cache / "ccd.pkl"
+        process_inputs(
+            data=data,
+            out_dir=out_dir,
+            ccd_path=ccd_path,
+            mol_dir=mol_dir,
+            use_msa_server=use_msa_server,
+            msa_server_url=msa_server_url,
+            msa_pairing_strategy=msa_pairing_strategy,
+            msa_server_username=msa_server_username,
+            msa_server_password=msa_server_password,
+            api_key_header=api_key_header,
+            api_key_value=api_key_value,
+            boltz2=model == "boltz2",
+            preprocessing_threads=preprocessing_threads,
+            max_msa_seqs=max_msa_seqs,
+        )
+
+        # Load manifest
+        manifest = Manifest.load(out_dir / "processed" / "manifest.json")
+
+        # Filter out existing predictions
+        filtered_manifest = filter_inputs_structure(
+            manifest=manifest,
+            outdir=out_dir,
+            override=override,
+        )
+
+        # Load processed data
+        processed_dir = out_dir / "processed"
+        processed = BoltzProcessedInput(
+            manifest=filtered_manifest,
+            targets_dir=processed_dir / "structures",
+            msa_dir=processed_dir / "msa",
+            constraints_dir=((processed_dir / "constraints") if (processed_dir / "constraints").exists() else None),
+            template_dir=((processed_dir / "templates") if (processed_dir / "templates").exists() else None),
+            extra_mols_dir=((processed_dir / "mols") if (processed_dir / "mols").exists() else None),
+        )
 
     # Set up trainer
     strategy = "auto"
