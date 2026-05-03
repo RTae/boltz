@@ -544,8 +544,8 @@ def parse_args():
     parser.add_argument(
         "--out_dir",
         type=str,
-        default="./multi_protein_results",
-        help="Root output directory (default: ./multi_protein_results).",
+        default="./test_output/boltz_results_profile_multi_protein_results",
+        help="Root output directory (default: ./test_output/boltz_results_profile_multi_protein_results).",
     )
     parser.add_argument(
         "--cache",
