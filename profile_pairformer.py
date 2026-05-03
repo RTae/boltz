@@ -462,7 +462,7 @@ def parse_args():
     parser.add_argument(
         "--out_dir",
         type=str,
-        default="./pairformer_profile_output",
+        default="./test_output/boltz_results_profile_output",
         help="Directory where JSON stats and plots are saved.",
     )
     parser.add_argument(
