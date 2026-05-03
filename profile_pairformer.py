@@ -447,6 +447,21 @@ def parse_args():
         help="Path to the YAML input file (default: examples/prot.yaml).",
     )
     parser.add_argument(
+        "--processed_dir",
+        type=str,
+        default=None,
+        help=(
+            "Path to an already-processed boltz predict output directory "
+            "(e.g. test_output/boltz_results_prot/processed). "
+            "When set, skips input processing entirely."
+        ),
+    )
+    parser.add_argument(
+        "--use_msa_server",
+        action="store_true",
+        help="Use the MMSeqs2 server for MSA generation (same as boltz predict --use_msa_server).",
+    )
+    parser.add_argument(
         "--cache",
         type=str,
         default=get_cache_path(),
@@ -496,37 +511,65 @@ def main():
     print("Checking / downloading Boltz-1 model weights …")
     download_boltz1(cache)
 
-    # ------------------------------------------------------------------
-    # 2. Process input
-    # ------------------------------------------------------------------
-    data_path = Path(args.input).expanduser()
-    if not data_path.exists():
-        print(f"ERROR: Input file not found: {data_path}", file=sys.stderr)
-        sys.exit(1)
-
-    work_dir = out_dir / "processed_input"
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Processing input: {data_path} …")
-    data_list = check_inputs(data_path)
-
     ccd_path = cache / "ccd.pkl"
     mol_dir = cache / "mols"
 
-    process_inputs(
-        data=data_list,
-        out_dir=work_dir,
-        ccd_path=ccd_path,
-        mol_dir=mol_dir,
-        msa_server_url="https://api.colabfold.com",
-        msa_pairing_strategy="greedy",
-        use_msa_server=False,
-        boltz2=False,
-        preprocessing_threads=min(4, multiprocessing.cpu_count()),
-    )
+    # ------------------------------------------------------------------
+    # 2. Process input (or reuse existing processed output)
+    # ------------------------------------------------------------------
+    if args.processed_dir:
+        # Fast path: reuse an already-processed boltz predict directory.
+        processed_dir = Path(args.processed_dir).expanduser()
+        manifest_path = processed_dir / "manifest.json"
+        if not manifest_path.exists():
+            print(f"ERROR: No manifest.json found in {processed_dir}", file=sys.stderr)
+            sys.exit(1)
+        manifest = Manifest.load(manifest_path)
+        print(f"Reusing pre-processed data from {processed_dir} "
+              f"({len(manifest.records)} record(s)).")
+    else:
+        data_path = Path(args.input).expanduser()
+        if not data_path.exists():
+            print(f"ERROR: Input file not found: {data_path}", file=sys.stderr)
+            sys.exit(1)
 
-    manifest = Manifest.load(work_dir / "processed" / "manifest.json")
-    processed_dir = work_dir / "processed"
+        work_dir = out_dir / "processed_input"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"Processing input: {data_path} …")
+        data_list = check_inputs(data_path)
+
+        manifest = process_inputs(
+            data=data_list,
+            out_dir=work_dir,
+            ccd_path=ccd_path,
+            mol_dir=mol_dir,
+            msa_server_url="https://api.colabfold.com",
+            msa_pairing_strategy="greedy",
+            use_msa_server=args.use_msa_server,
+            boltz2=False,
+            preprocessing_threads=min(4, multiprocessing.cpu_count()),
+        )
+
+        if not manifest or not manifest.records:
+            manifest_path = work_dir / "processed" / "manifest.json"
+            if manifest_path.exists():
+                manifest = Manifest.load(manifest_path)
+
+        if not manifest or not manifest.records:
+            print(
+                "ERROR: Manifest has no records. "
+                "If your input needs MSA, either:\n"
+                "  • pass --use_msa_server   (calls the MMSeqs2 server), or\n"
+                "  • pass --processed_dir test_output/boltz_results_prot/processed\n"
+                "    to reuse a previous 'boltz predict --use_msa_server' run.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        processed_dir = work_dir / "processed"
+        print(f"Manifest loaded with {len(manifest.records)} record(s).")
+
     processed = BoltzProcessedInput(
         manifest=manifest,
         targets_dir=processed_dir / "structures",
