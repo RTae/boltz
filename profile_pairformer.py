@@ -527,6 +527,27 @@ def main():
         manifest = Manifest.load(manifest_path)
         print(f"Reusing pre-processed data from {processed_dir} "
               f"({len(manifest.records)} record(s)).")
+
+        # Validate that the npz files are in Boltz-1 format (must have 'connections').
+        # boltz predict defaults to --model boltz2 whose npz format differs.
+        structures_dir = processed_dir / "structures"
+        npz_files = list(structures_dir.glob("*.npz"))
+        if npz_files:
+            import numpy as _np
+            probe = _np.load(npz_files[0])
+            if "connections" not in probe:
+                print(
+                    "ERROR: The .npz files in --processed_dir appear to be in "
+                    "Boltz-2 format (missing 'connections' field).\n"
+                    "  'boltz predict' defaults to --model boltz2, which writes a "
+                    "different structure format than Boltz-1 expects.\n\n"
+                    "Fix: let the script process the input itself in Boltz-1 format:\n"
+                    "  python profile_pairformer.py --use_msa_server\n"
+                    "     (or point --input at an input with msa: empty / pre-computed MSA)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            probe.close()
     else:
         data_path = Path(args.input).expanduser()
         if not data_path.exists():
@@ -559,10 +580,9 @@ def main():
         if not manifest or not manifest.records:
             print(
                 "ERROR: Manifest has no records. "
-                "If your input needs MSA, either:\n"
-                "  • pass --use_msa_server   (calls the MMSeqs2 server), or\n"
-                "  • pass --processed_dir test_output/boltz_results_prot/processed\n"
-                "    to reuse a previous 'boltz predict --use_msa_server' run.",
+                "If your input needs MSA, pass --use_msa_server to call the MMSeqs2 server.\n"
+                "NOTE: --processed_dir only works with data processed by this script "
+                "(boltz1 format). Data from 'boltz predict' (boltz2 format) is incompatible.",
                 file=sys.stderr,
             )
             sys.exit(1)
