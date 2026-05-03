@@ -825,8 +825,8 @@ def _parse_args():
     )
     p.add_argument(
         "--out_dir",
-        default="./test_output_long_results",
-        help="Output directory (default: ./test_output_long_results).",
+        default="./test_output/boltz_results_profile_long_results",
+        help="Output directory (default: ./test_output/boltz_results_profile_long_results).",
     )
     p.add_argument(
         "--cache",
