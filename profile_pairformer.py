@@ -38,7 +38,6 @@ from boltz.main import (
     PairformerArgs,
     check_inputs,
     download_boltz1,
-    filter_inputs_structure,
     get_cache_path,
     process_inputs,
 )
@@ -229,7 +228,7 @@ def run_trunk_forward(model: Boltz1, feats: Dict[str, torch.Tensor],
     recycling_steps = 1
 
     ctx_mgr = (
-        torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        torch.amp.autocast("cuda", dtype=torch.bfloat16)
         if use_bf16 and device.type == "cuda"
         else torch.no_grad()
     )
