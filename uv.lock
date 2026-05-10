@@ -173,6 +173,7 @@ dependencies = [
     { name = "modelcif" },
     { name = "numba" },
     { name = "numpy" },
+    { name = "nvidia-cusparselt-cu12" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pytorch-lightning" },
@@ -220,6 +221,7 @@ requires-dist = [
     { name = "modelcif", specifier = "==1.2" },
     { name = "numba", specifier = "==0.61.0" },
     { name = "numpy", specifier = ">=1.26,<2.0" },
+    { name = "nvidia-cusparselt-cu12", specifier = ">=0.7.1" },
     { name = "pandas", specifier = ">=2.2.2" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "pytorch-lightning", specifier = "==2.5.0" },
@@ -1223,6 +1225,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/73/b9/598f6ff36faaece4b3c50d26f50e38661499ff34346f00e057760b35cc9d/nvidia_cusparselt_cu12-0.7.1-py3-none-manylinux2014_aarch64.whl", hash = "sha256:8878dce784d0fac90131b6817b607e803c36e629ba34dc5b433471382196b6a5", size = 283835557, upload-time = "2025-02-26T00:16:54.265Z" },
     { url = "https://files.pythonhosted.org/packages/56/79/12978b96bd44274fe38b5dde5cfb660b1d114f70a65ef962bcbbed99b549/nvidia_cusparselt_cu12-0.7.1-py3-none-manylinux2014_x86_64.whl", hash = "sha256:f1bb701d6b930d5a7cea44c19ceb973311500847f81b634d802b7b539dc55623", size = 287193691, upload-time = "2025-02-26T00:15:44.104Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/d8/a6b0d0d0c2435e9310f3e2bb0d9c9dd4c33daef86aa5f30b3681defd37ea/nvidia_cusparselt_cu12-0.7.1-py3-none-win_amd64.whl", hash = "sha256:f67fbb5831940ec829c9117b7f33807db9f9678dc2a617fbe781cac17b4e1075", size = 271020911, upload-time = "2025-02-26T00:14:47.204Z" },
 ]
 
 [[package]]
