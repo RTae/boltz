@@ -2,7 +2,7 @@
 """
 boltz_training_profiler.py
 ──────────────────────────
-Profiles Boltz-1 (AlphaFold3-class) training-mode activations AND gradients
+Profiles Boltz-2 (AlphaFold3-class) training-mode activations AND gradients
 for the pair representation (z) across Pairformer blocks.
 
 Purpose: characterise activation / gradient distributions for MX/NV FP8/FP4
@@ -58,16 +58,16 @@ def discover_batch_format(model, boltz_src: str) -> None:
     print("\n=== training_step() signature ===")
     print(inspect.signature(model.training_step))
 
-    # Read boltz1.py source and show the forward method
-    boltz1_path = os.path.join(boltz_src, "boltz", "model", "models", "boltz1.py")
+    # Read boltz2.py source and show the forward method
+    boltz2_path = os.path.join(boltz_src, "boltz", "model", "models", "boltz2.py")
     try:
-        with open(boltz1_path) as fh:
+        with open(boltz2_path) as fh:
             src = fh.read()
         start = src.find("def forward")
-        print("\n=== boltz1.py: def forward (first 3000 chars) ===")
+        print("\n=== boltz2.py: def forward (first 3000 chars) ===")
         print(src[start : start + 3000])
     except FileNotFoundError:
-        print(f"  [warn] Could not open {boltz1_path}")
+        print(f"  [warn] Could not open {boltz2_path}")
 
     # Discover pairformer block container
     print("\n=== Pairformer block container ===")
@@ -94,6 +94,12 @@ def discover_batch_format(model, boltz_src: str) -> None:
         "token_bonds [N, N, 1]", "token_pad_mask [N]",
         "token_resolved_mask [N]", "token_disto_mask [N]",
         "pocket_feature [N, 4]", "cyclic_period [N]",
+        # Boltz-2 extras
+        "contact_conditioning [N, N, 5]  ← one-hot over 5 classes (UNSPECIFIED=0)",
+        "contact_threshold [N, N]        ← float distance threshold",
+        "type_bonds [N, N]               ← long, bond type index (bond_type_feature=True)",
+        "method_feature [N]              ← long, method class index",
+        "modified [N]                    ← long, 0/1 modified flag",
         # MSA-level
         "msa [n_msa, N, 33]", "msa_paired [n_msa, N]",
         "deletion_value [n_msa, N]", "has_deletion [n_msa, N]",
@@ -126,7 +132,7 @@ _ATOMS_PER_WINDOW = 32  # atoms_per_window_queries default
 
 def make_synthetic_batch(N: int, device: str, model) -> dict:
     """
-    Build a minimal synthetic feature dict for a Boltz-1 forward pass
+    Build a minimal synthetic feature dict for a Boltz-2 forward pass
     through the trunk (InputEmbedder → MSAModule → PairformerModule).
 
     Parameters
@@ -136,7 +142,7 @@ def make_synthetic_batch(N: int, device: str, model) -> dict:
     device : str
         'cuda' or 'cpu'.
     model :
-        Boltz1 instance (used to read hparams for optional validation).
+        Boltz2 instance (used to read hparams for optional validation).
 
     Returns
     -------
@@ -194,16 +200,13 @@ def make_synthetic_batch(N: int, device: str, model) -> dict:
     }
 
     # ── MSA-level ─────────────────────────────────────────────────────────────
-    # msa: one-hot over num_tokens classes
-    msa_idx = torch.full((1, n_msa, N), 2, dtype=torch.long, device=d)  # all "ALA"
-    msa_onehot = torch.nn.functional.one_hot(msa_idx, num_classes=_NUM_TOKENS).float()
-
+    # msa: integer indices (MSAModuleV2 calls one_hot internally)
     batch.update({
-        "msa":            msa_onehot,                                            # [1, n_msa, N, 33]
-        "msa_paired":     torch.zeros(1, n_msa, N, device=d),                  # [1, n_msa, N]
-        "deletion_value": torch.zeros(1, n_msa, N, device=d),                  # [1, n_msa, N]
-        "has_deletion":   torch.zeros(1, n_msa, N, dtype=torch.bool, device=d),# [1, n_msa, N]
-        "msa_mask":       torch.ones(1, n_msa, N, device=d),                   # [1, n_msa, N]
+        "msa":            torch.full((1, n_msa, N), 2, dtype=torch.long, device=d),   # [1, n_msa, N]
+        "msa_paired":     torch.zeros(1, n_msa, N, device=d),                         # [1, n_msa, N]
+        "deletion_value": torch.zeros(1, n_msa, N, device=d),                         # [1, n_msa, N]
+        "has_deletion":   torch.zeros(1, n_msa, N, device=d),                         # [1, n_msa, N] float
+        "msa_mask":       torch.ones(1, n_msa, N, device=d),                          # [1, n_msa, N]
     })
 
     # ── Atom-level ────────────────────────────────────────────────────────────
@@ -240,6 +243,29 @@ def make_synthetic_batch(N: int, device: str, model) -> dict:
         "atom_to_token":        atom_to_token,                                   # [1, n_atoms, N]
     })
 
+    # ── Boltz-2-specific feats ────────────────────────────────────────────────
+    # contact_conditioning: one-hot over 5 classes (UNSPECIFIED=0 → all tokens
+    # unspecified → only index 0 is 1, rest 0)
+    contact_cond = torch.zeros(1, N, N, 5, device=d)
+    contact_cond[:, :, :, 0] = 1.0        # all UNSPECIFIED
+
+    # type_bonds: long tensor [1, N, N], 0 = no bond (used by bond_type_feature)
+    type_bonds = torch.zeros(1, N, N, dtype=torch.long, device=d)
+
+    # method_feature: int index per token (0 = first method class)
+    method_feature = torch.zeros(1, N, dtype=torch.long, device=d)
+
+    # modified: int flag per token (0 = unmodified residue)
+    modified = torch.zeros(1, N, dtype=torch.long, device=d)
+
+    batch.update({
+        "contact_conditioning": contact_cond,                                    # [1, N, N, 5]
+        "contact_threshold":    torch.zeros(1, N, N, device=d),                 # [1, N, N]
+        "type_bonds":           type_bonds,                                      # [1, N, N]
+        "method_feature":       method_feature,                                  # [1, N]
+        "modified":             modified,                                        # [1, N]
+    })
+
     return batch
 
 
@@ -249,7 +275,7 @@ def make_synthetic_batch(N: int, device: str, model) -> dict:
 
 def compute_proxy_loss(model, feats: dict, device: str) -> torch.Tensor:
     """
-    Run the Boltz-1 trunk (InputEmbedder → MSA → Pairformer → Distogram)
+    Run the Boltz-2 trunk (InputEmbedder → MSA → Pairformer → Distogram)
     and return a scalar proxy loss that flows gradients through all
     Pairformer blocks.
 
@@ -274,6 +300,11 @@ def compute_proxy_loss(model, feats: dict, device: str) -> torch.Tensor:
     z_init = z_init + rel_pos_enc
     z_init = z_init + model.token_bonds(feats["token_bonds"].float())
 
+    # ── Boltz-2 extras ──
+    if model.bond_type_feature:
+        z_init = z_init + model.token_bonds_type(feats["type_bonds"].long())
+    z_init = z_init + model.contact_conditioning(feats)
+
     # ── Recycling (0 extra recycles — just the final round) ──
     s = torch.zeros_like(s_init)
     z = torch.zeros_like(z_init)
@@ -286,8 +317,10 @@ def compute_proxy_loss(model, feats: dict, device: str) -> torch.Tensor:
     pair_mask = mask[:, :, None] * mask[:, None, :]
 
     # ── MSA module (updates z) ──
-    if not model.no_msa:
-        z = z + model.msa_module(z, s_inputs, feats, use_kernels=False)
+    msa_module = model.msa_module
+    if hasattr(msa_module, "_orig_mod") and not model.training:
+        msa_module = msa_module._orig_mod
+    z = z + msa_module(z, s_inputs, feats, use_kernels=False)
 
     # ── Pairformer ──
     pairformer = model.pairformer_module
@@ -921,7 +954,7 @@ def plot_memory_vs_seqlen(all_results: dict, outdir: Path,
     Red X markers show OOM events and which phase (forward / backward).
     Horizontal dashed line = GPU memory limit.
     """
-    Ns_ok   = sorted(k for k, v in all_results.items() if not v.get("oom"))
+    Ns_ok   = sorted(k for k, v in all_results.items() if not v.get("oom") and "memory" in v)
     Ns_oom  = sorted(k for k, v in all_results.items() if v.get("oom"))
 
     if not Ns_ok:
@@ -1013,7 +1046,7 @@ def _get_token_z(model) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Profile Boltz-1 training activations and gradients "
+        description="Profile Boltz-2 training activations and gradients "
                     "for MX/NV FP8/FP4 mixed-precision research."
     )
     parser.add_argument(
@@ -1021,8 +1054,8 @@ def main() -> None:
         help="Path to boltz/src directory (contains boltz/ package)",
     )
     parser.add_argument(
-        "--ckpt_path", default="~/.boltz/boltz1.ckpt",
-        help="Path to boltz1.ckpt checkpoint",
+        "--ckpt_path", default="/root/.boltz/boltz2_aff.ckpt",
+        help="Path to checkpoint file",
     )
     parser.add_argument(
         "--output_dir", required=True,
@@ -1050,11 +1083,30 @@ def main() -> None:
 
     # ── Load model ────────────────────────────────────────────────────────────
     sys.path.insert(0, args.boltz_src)
-    from boltz.model.models.boltz1 import Boltz1  # noqa: PLC0415
+    from boltz.model.models.boltz2 import Boltz2  # noqa: PLC0415
 
-    ckpt_path = os.path.expanduser(args.ckpt_path)
+    ckpt_path = args.ckpt_path
     print(f"\nLoading checkpoint: {ckpt_path}")
-    model = Boltz1.load_from_checkpoint(ckpt_path, map_location="cpu")
+
+    # The checkpoint may have been saved with a slightly newer codebase.
+    # We patch hparams in-memory to handle two known mismatches:
+    #   1. pairformer_args missing 'v2': the checkpoint uses AttentionPairBiasV2
+    #      (no norm_s) but the default v2=False would create the old AttentionPairBias.
+    #   2. diffusion_process_args contains 'mse_rotational_alignment' not in
+    #      the current AtomDiffusion signature (handled by **kwargs above).
+    import tempfile  # noqa: PLC0415
+    raw_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    pa = raw_ckpt["hyper_parameters"].setdefault("pairformer_args", {})
+    pa["v2"] = True   # checkpoint uses AttentionPairBiasV2 layers
+
+    with tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False) as tmp:
+        torch.save(raw_ckpt, tmp.name)
+        tmp_ckpt_path = tmp.name
+
+    try:
+        model = Boltz2.load_from_checkpoint(tmp_ckpt_path, map_location="cpu")
+    finally:
+        os.unlink(tmp_ckpt_path)
 
     device = args.device
     if device == "cuda" and not torch.cuda.is_available():
@@ -1062,8 +1114,11 @@ def main() -> None:
         device = "cpu"
 
     model = model.to(device)
+    # The affinity checkpoint has most trunk parameters frozen (requires_grad=False).
+    # For gradient profiling we need gradients through all Pairformer layers.
+    model.requires_grad_(True)
     model.train()   # TRAINING MODE — critical for gradient profiling
-    print(f"Model on {device}, in training mode.")
+    print(f"Model on {device}, in training mode (all parameters unfrozen).")
 
     # ── Step 1: discover (optional) ───────────────────────────────────────────
     if args.discover:
