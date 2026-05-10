@@ -745,12 +745,93 @@ def plot_all(all_results: dict, output_dir: Path) -> None:
 
 
 # ============================================================
+# Preprocessing helper (--preprocess mode)
+# ============================================================
+
+def run_preprocessing(
+    input_dir: Path,
+    output_dir: Path,
+    boltz_src: str,
+    cache_dir: str = "~/.boltz",
+    use_msa_server: bool = False,
+    msa_server_url: str = "https://api.colabfold.com",
+    boltz2: bool = False,
+) -> Path:
+    """
+    Run Boltz's preprocessing pipeline on raw YAML/FASTA inputs and return
+    the path to the resulting processed/ directory.
+
+    Parameters
+    ----------
+    input_dir   : directory containing .yaml or .fasta files
+    output_dir  : profiler output root; processed/ is written to output_dir/preprocessed/
+    boltz_src   : path to boltz/src
+    cache_dir   : Boltz cache directory (holds ccd.pkl, model weights)
+    use_msa_server : run MMSeqs2 via ColabFold API
+    msa_server_url : MSA server URL
+    boltz2      : use Boltz-2 preprocessing (CCD vs mol dir)
+    """
+    if boltz_src not in sys.path:
+        sys.path.insert(0, boltz_src)
+
+    import pickle  # noqa: PLC0415
+    from boltz.main import process_inputs, download_boltz1, download_boltz2  # noqa: PLC0415
+    from boltz.data.mol import load_canonicals  # noqa: PLC0415
+
+    cache = Path(cache_dir).expanduser()
+    cache.mkdir(parents=True, exist_ok=True)
+    ccd_path = cache / "ccd.pkl"
+    mol_dir  = cache / "mols"
+
+    # Download CCD / mol data if not already cached
+    if boltz2:
+        if not mol_dir.exists():
+            download_boltz2(cache)
+    else:
+        if not ccd_path.exists():
+            download_boltz1(cache)
+
+    # Collect all YAML/FASTA input files
+    data = sorted(
+        list(input_dir.glob("*.yaml"))
+        + list(input_dir.glob("*.yml"))
+        + list(input_dir.glob("*.fasta"))
+        + list(input_dir.glob("*.fa"))
+    )
+    if not data:
+        raise FileNotFoundError(
+            f"No .yaml/.fasta files found in {input_dir}. "
+            "Pass a directory containing Boltz input files."
+        )
+    print(f"[preprocess] Found {len(data)} input file(s): {[f.name for f in data]}")
+
+    preproc_dir = output_dir / "preprocessed"
+    preproc_dir.mkdir(parents=True, exist_ok=True)
+
+    process_inputs(
+        data=data,
+        out_dir=preproc_dir,
+        ccd_path=ccd_path,
+        mol_dir=mol_dir,
+        use_msa_server=use_msa_server,
+        msa_server_url=msa_server_url,
+        msa_pairing_strategy="greedy",
+        boltz2=boltz2,
+        preprocessing_threads=1,
+        max_msa_seqs=8192,
+    )
+
+    print(f"[preprocess] Done. Processed inputs at: {preproc_dir / 'processed'}")
+    return preproc_dir
+
+
+# ============================================================
 # Main
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Profile Boltz-1 pair representation activations for MX quantization research."
+        description="Profile Boltz pair representation activations for MX quantization research."
     )
     parser.add_argument(
         "--boltz_src",
@@ -770,15 +851,33 @@ def main():
         "--input_dir",
         required=True,
         help=(
-            "Boltz-processed output directory, or parent directory of "
-            "per-protein Boltz-processed subdirectories.\n"
-            "Each entry must have processed/manifest.json."
+            "With --preprocess: directory of raw .yaml/.fasta input files. "
+            "Without --preprocess: Boltz-processed output dir (must contain "
+            "processed/manifest.json), or parent dir of such subdirectories."
         ),
     )
     parser.add_argument(
         "--output_dir",
         required=True,
         help="Directory where raw NPZ, summary JSON, and plots are saved.",
+    )
+    parser.add_argument(
+        "--preprocess",
+        action="store_true",
+        help=(
+            "Run Boltz preprocessing on raw YAML/FASTA inputs in --input_dir "
+            "before profiling. Saves preprocessed data to output_dir/preprocessed/."
+        ),
+    )
+    parser.add_argument(
+        "--use_msa_server",
+        action="store_true",
+        help="(Only used with --preprocess) Fetch MSAs via the ColabFold MMSeqs2 server.",
+    )
+    parser.add_argument(
+        "--cache",
+        default="~/.boltz",
+        help="(Only used with --preprocess) Boltz cache dir. Default: ~/.boltz",
     )
     parser.add_argument(
         "--device",
@@ -804,6 +903,23 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- Optional preprocessing step ----
+    if args.preprocess:
+        is_boltz2_ckpt = "boltz2" in os.path.basename(
+            os.path.expanduser(args.ckpt_path)
+        ).lower()
+        preproc_dir = run_preprocessing(
+            input_dir=Path(args.input_dir),
+            output_dir=output_dir,
+            boltz_src=args.boltz_src,
+            cache_dir=args.cache,
+            use_msa_server=args.use_msa_server,
+            boltz2=is_boltz2_ckpt,
+        )
+        scan_dir = preproc_dir
+    else:
+        scan_dir = Path(args.input_dir)
+
     # ---- Load model ----
     model, model_name = load_model(args.ckpt_path, args.boltz_src, device)
 
@@ -811,8 +927,8 @@ def main():
     activations, hook_handles = register_hooks(model)
 
     # ---- Discover inputs ----
-    print(f"\n[input] Scanning {args.input_dir} ...")
-    all_proteins = _discover_protein_inputs(Path(args.input_dir), args.boltz_src)
+    print(f"\n[input] Scanning {scan_dir} ...")
+    all_proteins = _discover_protein_inputs(scan_dir, args.boltz_src)
 
     if args.proteins:
         whitelist = set(args.proteins)
