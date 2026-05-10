@@ -37,6 +37,8 @@ dependencies = [
     "nvidia-cusparselt-cu12>=0.7.1",
     "matplotlib>=3.10.9",
     "seaborn>=0.13.2",
+    "cuequivariance-torch>=0.10.0",
+    "cuequivariance-ops-torch-cu12>=0.10.0",
 ]
 
 [project.scripts]
