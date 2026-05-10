@@ -35,6 +35,8 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "nvidia-cusparselt-cu12>=0.7.1",
+    "matplotlib>=3.10.9",
+    "seaborn>=0.13.2",
 ]
 
 [project.scripts]
