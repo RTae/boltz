@@ -503,6 +503,15 @@ class HookManager:
         def patched_forward(s, z, mask, k_in, multiplicity=1):
             # Replicate the v2 forward, injecting the capture
             B = s.shape[0]
+            # ---- CAPTURE INPUT (s tensor) ----
+            # The outer forward hook cannot see this because PairformerLayer calls
+            # attention(...) with all keyword args, leaving inputs=() in the hook.
+            with torch.no_grad():
+                rec = manager._build_record(
+                    s, layer_index, msa_layer_index, op_name, "input"
+                )
+                if rec is not None:
+                    manager._write_record(rec)
             q = module.proj_q(s).view(B, -1, module.num_heads, module.head_dim)
             k = module.proj_k(k_in).view(B, -1, module.num_heads, module.head_dim)
             v = module.proj_v(k_in).view(B, -1, module.num_heads, module.head_dim)
