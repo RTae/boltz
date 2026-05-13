@@ -1215,8 +1215,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--input", required=True, type=Path,
                    help=".yaml or .fasta input file (same format as boltz predict).")
-    p.add_argument("--output_dir", default=Path("./activation_stats"), type=Path,
-                   help="Directory for JSONL output files. Default: ./activation_stats")
+    p.add_argument("--output_dir", default=Path("./boltz_results/activation_stats"), type=Path,
+                   help="Directory for JSONL output files. Default: ./boltz_results/activation_stats")
     p.add_argument("--cache", default=None, type=Path,
                    help="Boltz cache directory (default: ~/.boltz or $BOLTZ_CACHE).")
     p.add_argument("--use_msa_server", action="store_true",
