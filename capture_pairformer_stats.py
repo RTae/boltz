@@ -989,7 +989,6 @@ def prepare_input(
         template_dir=processed.template_dir,
         extra_mols_dir=processed.extra_mols_dir,
     )
-    data_module.setup()
 
     return data_module, manifest
 
