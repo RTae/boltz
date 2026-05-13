@@ -223,11 +223,18 @@ def _compute_tensor_stats(
     kurt = _kurtosis(flat)
 
     # Percentiles (of absolute values)
+    # torch.quantile is limited to 2^24 elements; subsample for large tensors.
+    _QUANTILE_MAX = 1 << 20   # 1M elements — sufficient for stable percentiles
+    t_abs_q = t_abs
+    if t_abs.numel() > _QUANTILE_MAX:
+        idx = torch.randperm(t_abs.numel(), device=t_abs.device)[:_QUANTILE_MAX]
+        t_abs_q = t_abs[idx]
     percs = torch.quantile(
-        t_abs,
+        t_abs_q,
         torch.tensor([0.50, 0.90, 0.99, 0.999, 0.9999], device=t.device),
     )
     p50, p90, p99, p99_9, p99_99 = percs.tolist()
+    del t_abs_q
 
     # MXFP8 overflow fractions
     frac_gt6     = (t_abs > 6.0).float().mean().item()
