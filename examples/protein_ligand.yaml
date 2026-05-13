@@ -1,0 +1,11 @@
+# HIV-1 protease homodimer + indinavir
+# PDB: 1HSG  |  protein chains: A (each ~99 aa)
+# Ligand: indinavir (CCD code IDV)
+version: 1
+sequences:
+  - protein:
+      id: A
+      sequence: PQITLWQRPLVTIKIGGQLKEALLDTGADDTVLEEMSLPGRWKPKMIGGIGGFIKVRQYDQILIEICGHKAIGTVLVGPTPVNIIGRNLLTQIGCTLNF
+  - ligand:
+      id: C
+      ccd: IDV

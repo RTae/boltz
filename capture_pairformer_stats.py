@@ -35,12 +35,14 @@ Operator inventory (from Phase-1 discovery):
 from __future__ import annotations
 
 import argparse
+import datetime
 import gc
 import json
 import logging
 import os
 import pickle
 import platform
+import subprocess
 import tarfile
 import traceback
 import urllib.request
@@ -129,6 +131,17 @@ class ActivationRecord:
     offdiag_std: float
     diag_to_offdiag_ratio: float
 
+    # Extended stats for high-value tensors (abs_max > 100 only; else None)
+    histogram_bins: Optional[List[float]] = field(default=None)
+    histogram_counts: Optional[List[int]] = field(default=None)
+    top_1000_abs_values: Optional[List[float]] = field(default=None)
+    top_1000_abs_indices: Optional[List[List[int]]] = field(default=None)
+
+    # OuterProductMean input-specific stats (else None)
+    sparsity: Optional[float] = field(default=None)
+    p999_to_p50_ratio: Optional[float] = field(default=None)
+    opm_top20_rows: Optional[List[dict]] = field(default=None)
+
 
 @dataclass
 class WeightRecord:
@@ -188,6 +201,8 @@ def _kurtosis(x: Tensor) -> float:
 def _compute_tensor_stats(
     t: Tensor,
     top_k: int = 100,
+    operator_name: str = "",
+    tensor_role: str = "",
 ) -> Dict[str, Any]:
     """Compute the full statistics dictionary for a single tensor on GPU.
 
@@ -244,6 +259,10 @@ def _compute_tensor_stats(
     offdiag_std     = -1.0
     diag_to_offdiag = -1.0
 
+    # Extended: populated conditionally below
+    top_1000_abs_values: Optional[List[float]] = None
+    top_1000_abs_indices: Optional[List[List[int]]] = None
+
     if t_f.ndim == 4 and t_f.shape[1] == t_f.shape[2]:
         B, N, _, D = t_f.shape
 
@@ -258,7 +277,19 @@ def _compute_tensor_stats(
         d_idx = top_idx_flat % D
         top_k_abs_values = top_vals.tolist()
         top_k_indices     = torch.stack([i_idx, j_idx, d_idx], dim=1).tolist()
-        del flat0, top_vals, top_idx_flat, i_idx, j_idx, d_idx
+        del top_vals, top_idx_flat, i_idx, j_idx, d_idx
+
+        # top_1000 when abs_max > 100 — full outlier index capture
+        if abs_max > 100:
+            k1000 = min(1000, flat0.numel())
+            top1k_vals, top1k_idx = torch.topk(flat0, k1000)
+            i1k = top1k_idx // (N * D)
+            j1k = (top1k_idx % (N * D)) // D
+            d1k = top1k_idx % D
+            top_1000_abs_values = top1k_vals.tolist()
+            top_1000_abs_indices = torch.stack([i1k, j1k, d1k], dim=1).tolist()
+            del top1k_vals, top1k_idx, i1k, j1k, d1k
+        del flat0
 
         # Symmetry stats
         t0_T = t0.transpose(0, 1)   # z[j,i,d] → z_T[i,j,d]
@@ -300,6 +331,48 @@ def _compute_tensor_stats(
         diag_to_offdiag = diag_abs_max / (offdiag_abs_max + 1e-8)
         del t0_abs, diag_vals, offdiag_vals, diag_mask, t0, t0_T
 
+    # --- Histogram for high-value tensors (abs_max > 100) ---
+    histogram_bins: Optional[List[float]] = None
+    histogram_counts: Optional[List[int]] = None
+    if abs_max > 100:
+        try:
+            hist_counts = torch.histc(flat, bins=50, min=-abs_max, max=abs_max)
+            bin_width = 2.0 * abs_max / 50
+            histogram_bins = [float(-abs_max + i * bin_width) for i in range(51)]
+            histogram_counts = hist_counts.long().tolist()
+        except Exception:
+            pass
+
+    # --- OuterProductMean input-specific stats ---
+    sparsity: Optional[float] = None
+    p999_to_p50_ratio: Optional[float] = None
+    opm_top20_rows: Optional[List[dict]] = None
+    if operator_name == "OuterProductMean" and tensor_role == "input":
+        sparsity = float((t_abs < 1e-3).float().mean().item())
+        p999_to_p50_ratio = float(p99_9 / (p50 + 1e-8))
+        if t_f.ndim == 4:
+            _B, S, N_opm, d_opm = t_f.shape
+            t0_msa = t_f[0]             # [S, N, d]
+            t0_msa_abs = t0_msa.abs()   # [S, N, d]
+            row_abs_max, argmax_s = t0_msa_abs.max(dim=0)  # [N, d] each
+            k20 = min(20, row_abs_max.numel())
+            flat_ram = row_abs_max.flatten()
+            top20_vals, top20_idx = torch.topk(flat_ram, k20)
+            n_idx_20 = top20_idx // d_opm
+            d_idx_20 = top20_idx % d_opm
+            s_idx_20 = argmax_s[n_idx_20, d_idx_20]
+            opm_top20_rows = [
+                {
+                    "n_idx": int(n.item()),
+                    "d_idx": int(di.item()),
+                    "s_idx": int(s.item()),
+                    "max_abs_val": float(v.item()),
+                }
+                for n, di, s, v in zip(n_idx_20, d_idx_20, s_idx_20, top20_vals)
+            ]
+            del t0_msa, t0_msa_abs, row_abs_max, argmax_s
+            del flat_ram, top20_vals, top20_idx, n_idx_20, d_idx_20, s_idx_20
+
     del t_f, flat, t_abs
 
     return dict(
@@ -315,6 +388,13 @@ def _compute_tensor_stats(
         diag_abs_max=diag_abs_max, diag_mean=diag_mean, diag_std=diag_std,
         offdiag_abs_max=offdiag_abs_max, offdiag_mean=offdiag_mean, offdiag_std=offdiag_std,
         diag_to_offdiag_ratio=diag_to_offdiag,
+        histogram_bins=histogram_bins,
+        histogram_counts=histogram_counts,
+        top_1000_abs_values=top_1000_abs_values,
+        top_1000_abs_indices=top_1000_abs_indices,
+        sparsity=sparsity,
+        p999_to_p50_ratio=p999_to_p50_ratio,
+        opm_top20_rows=opm_top20_rows,
     )
 
 
@@ -407,7 +487,11 @@ class HookManager:
         tensor_role: str,
     ) -> Optional[ActivationRecord]:
         try:
-            stats = _compute_tensor_stats(t, self.top_k)
+            stats = _compute_tensor_stats(
+                t, self.top_k,
+                operator_name=operator_name,
+                tensor_role=tensor_role,
+            )
             return ActivationRecord(
                 layer_index=layer_index,
                 msa_layer_index=msa_layer_index,
@@ -1214,8 +1298,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--input", required=True, type=Path,
                    help=".yaml or .fasta input file (same format as boltz predict).")
-    p.add_argument("--output_dir", default=Path("./boltz_results/activation_stats"), type=Path,
-                   help="Directory for JSONL output files. Default: ./boltz_results/activation_stats")
+    p.add_argument("--output_dir", default=Path("./boltz_results_stats"), type=Path,
+                   help="Root stats directory. Per-input results go to output_dir/{input_name}/. "
+                        "Default: ./boltz_results_stats")
     p.add_argument("--cache", default=None, type=Path,
                    help="Boltz cache directory (default: ~/.boltz or $BOLTZ_CACHE).")
     p.add_argument("--use_msa_server", action="store_true",
@@ -1225,13 +1310,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_seqlen", default=800, type=int,
                    help="Skip inputs longer than this (approximate token count).")
     p.add_argument(
+        "--sampling_preset",
+        default="sparse",
+        choices=["sparse", "medium", "dense", "all"],
+        help="Layer sampling density preset: sparse=9 layers, medium=17, dense=33, all=64. "
+             "Ignored when --layers_to_capture is set explicitly. (default: sparse)",
+    )
+    p.add_argument(
         "--layers_to_capture",
-        default="0,8,16,24,32,40,48,56,63",
+        default=None,
         type=str,
-        help=(
-            '"all" or comma-separated layer indices, e.g. "0,8,16,24,32,40,48,56,63". '
-            'Default: "0,8,16,24,32,40,48,56,63"'
-        ),
+        help='Comma-separated layer indices, e.g. "0,8,16,32,63". '
+             'Overrides --sampling_preset when set.',
     )
     p.add_argument("--capture_weights", action="store_true",
                    help="Run one-time weight analysis before inference.")
@@ -1253,13 +1343,114 @@ def resolve_cache(cache_arg: Optional[Path]) -> Path:
     return Path("~/.boltz").expanduser()
 
 
-def resolve_layers(spec: str, num_blocks: int = 64) -> List[int]:
-    if spec.strip().lower() == "all":
-        return list(range(num_blocks))
+_SAMPLING_PRESETS: Dict[str, List[int]] = {
+    # sparse: 9 layers
+    "sparse": sorted(set(list(range(0, 64, 8)) + [63])),
+    # medium: every 4th layer + last = 17 layers
+    "medium": sorted(set(list(range(0, 64, 4)) + [63])),
+    # dense: every 2nd layer + last = 33 layers
+    "dense":  sorted(set(list(range(0, 64, 2)) + [63])),
+    # all: 64 layers
+    "all":    list(range(64)),
+}
+
+
+def resolve_layers(
+    spec: Optional[str],
+    preset: str = "sparse",
+    num_blocks: int = 64,
+) -> List[int]:
+    """Return list of layer indices to capture.
+
+    --layers_to_capture (spec) takes priority over --sampling_preset (preset).
+    """
+    if spec is not None:
+        if spec.strip().lower() == "all":
+            return list(range(num_blocks))
+        try:
+            return [int(x.strip()) for x in spec.split(",") if x.strip()]
+        except ValueError:
+            raise ValueError(f"Invalid --layers_to_capture spec: {spec!r}")
+    key = preset.strip().lower()
+    if key not in _SAMPLING_PRESETS:
+        raise ValueError(
+            f"Unknown --sampling_preset: {preset!r}. "
+            f"Choose from {list(_SAMPLING_PRESETS)}"
+        )
+    return [li for li in _SAMPLING_PRESETS[key] if li < num_blocks]
+
+
+def _write_meta_json(
+    meta_file: Path,
+    input_path: Path,
+    manifest: Any,
+    args: argparse.Namespace,
+    device: str,
+) -> None:
+    """Write a meta.json file capturing run provenance and input properties."""
+    meta: Dict[str, Any] = {}
+
+    # Input YAML content
     try:
-        return [int(x.strip()) for x in spec.split(",") if x.strip()]
-    except ValueError:
-        raise ValueError(f"Invalid --layers_to_capture spec: {spec!r}")
+        meta["input_yaml"] = input_path.read_text()
+    except Exception:
+        meta["input_yaml"] = None
+
+    # Sequence info from manifest
+    meta["seqlen"] = 0
+    meta["num_chains"] = 0
+    meta["chain_types"] = {"protein": 0, "rna": 0, "dna": 0, "ligand": 0, "other": 0}
+    for rec in manifest.records:
+        meta["num_chains"] += len(rec.chains)
+        total_len = 0
+        for chain in rec.chains:
+            seq = getattr(chain, "sequence", "") or ""
+            total_len += len(seq)
+            entity_type = getattr(chain, "entity_type", None)
+            if entity_type is not None:
+                type_name = str(entity_type).lower()
+                if "protein" in type_name:
+                    meta["chain_types"]["protein"] += 1
+                elif "rna" in type_name:
+                    meta["chain_types"]["rna"] += 1
+                elif "dna" in type_name:
+                    meta["chain_types"]["dna"] += 1
+                elif "ligand" in type_name or "small" in type_name:
+                    meta["chain_types"]["ligand"] += 1
+                else:
+                    meta["chain_types"]["other"] += 1
+        meta["seqlen"] = max(meta["seqlen"], total_len)
+
+    # Timestamp
+    meta["timestamp"] = datetime.datetime.utcnow().isoformat() + "Z"
+
+    # Git commit hash
+    try:
+        git_hash = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            cwd=Path(__file__).parent,
+        ).decode().strip()
+        meta["git_commit"] = git_hash
+    except Exception:
+        meta["git_commit"] = None
+
+    # GPU model
+    try:
+        if torch.cuda.is_available() and "cuda" in device:
+            dev_idx = int(device.split(":")[-1]) if ":" in device else 0
+            meta["gpu_model"] = torch.cuda.get_device_name(dev_idx)
+        else:
+            meta["gpu_model"] = "cpu"
+    except Exception:
+        meta["gpu_model"] = None
+
+    # Args (serialise to strings for JSON compat)
+    meta["args"] = {k: str(v) for k, v in vars(args).items()}
+
+    with meta_file.open("w") as fh:
+        json.dump(meta, fh, indent=2)
+    log.info("Meta written → %s", meta_file)
 
 
 def main() -> None:
@@ -1274,12 +1465,22 @@ def main() -> None:
     cache = resolve_cache(args.cache)
     cache.mkdir(parents=True, exist_ok=True)
 
-    # Output dir
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # Per-input output directory: boltz_results_stats/{input_name}/
+    input_name = args.input.stem
+    per_input_dir = args.output_dir / input_name
+    per_input_dir.mkdir(parents=True, exist_ok=True)
+
+    # Processing / MSA cache dir at workspace root (reuses boltz predict cache)
+    proc_out_dir = Path(f"boltz_results_{input_name}")
 
     # Resolve layers
-    layers_to_capture = resolve_layers(args.layers_to_capture, num_blocks=64)
-    log.info("Layers to capture: %s", layers_to_capture)
+    layers_to_capture = resolve_layers(
+        args.layers_to_capture, preset=args.sampling_preset, num_blocks=64
+    )
+    log.info(
+        "Sampling preset=%s  layers_to_capture=%s",
+        args.sampling_preset, layers_to_capture,
+    )
 
     # ── Load model ──────────────────────────────────────────────────────────
     torch.set_grad_enabled(False)
@@ -1295,17 +1496,12 @@ def main() -> None:
         diffusion_samples=args.diffusion_samples,
     )
 
-    checkpoint_name = "boltz2_conf"
-
     # ── Weight analysis ──────────────────────────────────────────────────────
     if args.capture_weights:
-        weight_file = args.output_dir / f"{checkpoint_name}_weights.jsonl"
-        analyse_weights(model, weight_file, checkpoint_name)
+        weight_file = per_input_dir / "weights.jsonl"
+        analyse_weights(model, weight_file, "boltz2_conf")
 
     # ── Prepare input ────────────────────────────────────────────────────────
-    input_name = args.input.stem
-    proc_out_dir = args.output_dir / f"boltz_results_{input_name}"
-
     result = prepare_input(
         input_path=args.input,
         out_dir=proc_out_dir,
@@ -1319,8 +1515,17 @@ def main() -> None:
 
     data_module, manifest = result
 
+    # ── Meta JSON ────────────────────────────────────────────────────────────
+    _write_meta_json(
+        meta_file=per_input_dir / "meta.json",
+        input_path=args.input,
+        manifest=manifest,
+        args=args,
+        device=args.device,
+    )
+
     # ── Activation capture ───────────────────────────────────────────────────
-    activation_file = args.output_dir / f"{input_name}_activations.jsonl"
+    activation_file = per_input_dir / "activations.jsonl"
     log.info("Writing activations → %s", activation_file)
 
     run_capture(
@@ -1335,7 +1540,7 @@ def main() -> None:
     )
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    summary_file = args.output_dir / f"{input_name}_summary.txt"
+    summary_file = per_input_dir / "summary.txt"
     print_summary(activation_file, summary_file)
 
 
