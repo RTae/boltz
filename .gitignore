@@ -166,3 +166,4 @@ cython_debug/
 boltz_results_*/
 
 *.tar
+*.npz
