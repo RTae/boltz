@@ -167,3 +167,5 @@ boltz_results_*/
 
 *.tar
 *.npz
+manifest.json
+config.yaml
