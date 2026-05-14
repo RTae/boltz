@@ -167,5 +167,8 @@ boltz_results_*/
 
 *.tar
 *.npz
-manifest.json
-config.yaml
+openfold_processed_targets
+openfold_processed_msa
+rcsb_processed_targets
+rcsb_processed_msa
+symmetry.pkl
