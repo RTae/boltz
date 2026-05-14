@@ -174,6 +174,7 @@ def factored_lddt_loss(
         "intra_rna": intra_rna_lddt,
         "intra_protein": intra_protein_lddt,
         "protein_protein": protein_protein_lddt,
+        "modified": torch.zeros_like(protein_protein_lddt),
     }
 
     total_dict = {
@@ -187,6 +188,7 @@ def factored_lddt_loss(
         "intra_rna": intra_rna_total,
         "intra_protein": intra_protein_total,
         "protein_protein": protein_protein_total,
+        "modified": torch.zeros_like(protein_protein_total),
     }
     if not cardinality_weighted:
         for key in total_dict:
@@ -322,6 +324,7 @@ def factored_token_lddt_dist_loss(true_d, pred_d, feats, cardinality_weighted=Fa
         "intra_rna": intra_rna_lddt,
         "intra_protein": intra_protein_lddt,
         "protein_protein": protein_protein_lddt,
+        "modified": torch.zeros_like(protein_protein_lddt),
     }
 
     total_dict = {
@@ -335,6 +338,7 @@ def factored_token_lddt_dist_loss(true_d, pred_d, feats, cardinality_weighted=Fa
         "intra_rna": intra_rna_total,
         "intra_protein": intra_protein_total,
         "protein_protein": protein_protein_total,
+        "modified": torch.zeros_like(protein_protein_total),
     }
 
     if not cardinality_weighted:

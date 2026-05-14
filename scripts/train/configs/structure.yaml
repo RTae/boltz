@@ -50,8 +50,8 @@ data:
     _target_: boltz.data.feature.featurizer.BoltzFeaturizer
 
   symmetries: /workspace/boltz/symmetry.pkl
-  max_tokens: 512
-  max_atoms: 4608
+  max_tokens: 256
+  max_atoms: 2304
   max_seqs: 2048
   pad_to_max_tokens: true
   pad_to_max_atoms: true
