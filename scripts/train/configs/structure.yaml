@@ -12,8 +12,9 @@ trainer:
 #   project: boltz
 #   entity: boltz
 
-output: SET_PATH_HERE
-pretrained: PATH_TO_CHECKPOINT_FILE
+output: /workspace/boltz/outputs
+# Set to a .ckpt path to warm-start from a pre-trained structure model, null to train from scratch
+pretrained: null
 resume: null
 disable_checkpoint: false
 matmul_precision: null
@@ -22,8 +23,8 @@ save_top_k: -1
 data:
   datasets:
     - _target_: boltz.data.module.training.DatasetConfig
-      target_dir: PATH_TO_TARGETS_DIR
-      msa_dir: PATH_TO_MSA_DIR
+      target_dir: /workspace/boltz/rcsb_processed_targets
+      msa_dir: /workspace/boltz/rcsb_processed_msa
       prob: 1.0
       sampler:
         _target_: boltz.data.sample.cluster.ClusterSampler
@@ -48,7 +49,7 @@ data:
   featurizer:
     _target_: boltz.data.feature.featurizer.BoltzFeaturizer
 
-  symmetries: PATH_TO_SYMMETRY_FILE
+  symmetries: /workspace/boltz/symmetry.pkl
   max_tokens: 512
   max_atoms: 4608
   max_seqs: 2048
@@ -75,7 +76,7 @@ data:
   compute_constraint_features: false
 
 model:
-  _target_: boltz.model.model.Boltz1
+  _target_: boltz.model.models.boltz1.Boltz1
   atom_s: 128
   atom_z: 16
   token_s: 384
