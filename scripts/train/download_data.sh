@@ -45,11 +45,22 @@ download_file() {
 
 download_archive() {
 	local archive_name="$1"
+	local extracted_name="$2"
 	local archive_path="$OUTPUT_DIR/$archive_name"
+	local extracted_path="$OUTPUT_DIR/$extracted_name"
 	local url="$BOLTZ_DATA_BASE_URL/$archive_name"
 
-	echo "Downloading $archive_name"
-	download_file "$url" "$archive_path"
+	if [[ -e "$extracted_path" ]]; then
+		echo "Skipping $archive_name because $extracted_path already exists"
+		return
+	fi
+
+	if [[ -f "$archive_path" ]]; then
+		echo "Using existing $archive_name"
+	else
+		echo "Downloading $archive_name"
+		download_file "$url" "$archive_path"
+	fi
 
 	echo "Extracting $archive_name"
 	tar -xf "$archive_path" -C "$OUTPUT_DIR"
@@ -61,6 +72,11 @@ download_plain_file() {
 	local file_path="$OUTPUT_DIR/$file_name"
 	local url="$BOLTZ_DATA_BASE_URL/$file_name"
 
+	if [[ -f "$file_path" ]]; then
+		echo "Skipping $file_name because $file_path already exists"
+		return
+	fi
+
 	echo "Downloading $file_name"
 	download_file "$url" "$file_path"
 }
@@ -70,16 +86,16 @@ download_dataset() {
 
 	case "$dataset" in
 		rcsb_targets)
-			download_archive "rcsb_processed_targets.tar"
+			download_archive "rcsb_processed_targets.tar" "rcsb_processed_targets"
 			;;
 		rcsb_msa)
-			download_archive "rcsb_processed_msa.tar"
+			download_archive "rcsb_processed_msa.tar" "rcsb_processed_msa"
 			;;
 		openfold_targets)
-			download_archive "openfold_processed_targets.tar"
+			download_archive "openfold_processed_targets.tar" "openfold_processed_targets"
 			;;
 		openfold_msa)
-			download_archive "openfold_processed_msa.tar"
+			download_archive "openfold_processed_msa.tar" "openfold_processed_msa"
 			;;
 		symmetry)
 			download_plain_file "symmetry.pkl"
