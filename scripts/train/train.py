@@ -236,6 +236,31 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
 
 
 if __name__ == "__main__":
-    arg1 = sys.argv[1]
-    arg2 = sys.argv[2:]
-    train(arg1, arg2)
+    import argparse
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("config", help="Path to YAML training config")
+    parser.add_argument(
+        "--diagnostic",
+        action="store_true",
+        help="Run FP8 numerical-stability diagnostics instead of normal training",
+    )
+    parser.add_argument(
+        "--diagnostic-steps",
+        type=int,
+        default=200,
+        dest="diagnostic_steps",
+        help="Training steps per diagnostic experiment (default: 200)",
+    )
+    known, remaining = parser.parse_known_args()
+
+    if known.diagnostic:
+        # fp8_diagnostics.py lives in the same directory as this script
+        _script_dir = str(Path(__file__).parent)
+        if _script_dir not in sys.path:
+            sys.path.insert(0, _script_dir)
+        from fp8_diagnostics import run_all_diagnostics  # noqa: PLC0415
+
+        run_all_diagnostics(known.config, remaining, n_steps=known.diagnostic_steps)
+    else:
+        train(known.config, remaining)
