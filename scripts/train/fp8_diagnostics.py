@@ -471,6 +471,92 @@ def _run_one(
         torch.cuda.empty_cache()
 
 
+# ── Subprocess worker (module-level so it is picklable for spawn) ────────────
+
+def _exp_worker(
+    result_q,
+    raw_config_path: str,
+    base_args: list,
+    config_overrides: dict,
+    csv_path: str,
+    log_every: int,
+    reference_losses: dict,
+    enable_nan_hooks: bool,
+    enable_grad_stats: bool,
+    grad_csv_path,
+    grad_log_every: int,
+    fp8_mode,
+    seed: int,
+    label: str,
+) -> None:
+    """Runs inside a spawned subprocess for a clean CUDA allocator state."""
+    cb = DiagnosticCallback(
+        csv_path=Path(csv_path),
+        log_every=log_every,
+        reference_losses=reference_losses,
+        enable_nan_hooks=enable_nan_hooks,
+        enable_grad_stats=enable_grad_stats,
+        grad_csv_path=Path(grad_csv_path) if grad_csv_path else None,
+        grad_log_every=grad_log_every,
+    )
+    _run_one(raw_config_path, base_args, config_overrides, cb, fp8_mode, seed, label)
+    result_q.put({
+        "final_loss": cb.final_loss,
+        "diverge_step": cb.diverge_step,
+        "peak_memory_mb": cb.peak_memory_mb,
+        "nan_first": cb._nan_first,
+        "losses_by_step": cb.losses_by_step,
+    })
+
+
+def _run_subprocess(
+    raw_config_path: str,
+    base_args: list,
+    config_overrides: dict,
+    csv_path: Path,
+    fp8_mode=None,
+    seed: int = 42,
+    label: str = "",
+    log_every: int = 10,
+    reference_losses: Optional[dict] = None,
+    enable_nan_hooks: bool = False,
+    enable_grad_stats: bool = False,
+    grad_csv_path: Optional[Path] = None,
+    grad_log_every: int = 50,
+) -> dict:
+    """Spawn a fresh process for one experiment and return its result dict.
+
+    Each experiment runs in an isolated CUDA context so peak_memory_mb
+    reflects only that experiment's allocations, with no fragmentation
+    carried over from previous runs.
+    """
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    p = ctx.Process(
+        target=_exp_worker,
+        args=(
+            q, raw_config_path, base_args, config_overrides,
+            str(csv_path), log_every, reference_losses or {},
+            enable_nan_hooks, enable_grad_stats,
+            str(grad_csv_path) if grad_csv_path else None, grad_log_every,
+            fp8_mode, seed, label,
+        ),
+    )
+    p.start()
+    p.join()
+    if not q.empty():
+        return q.get()
+    return {
+        "final_loss": None,
+        "diverge_step": None,
+        "peak_memory_mb": 0.0,
+        "nan_first": None,
+        "losses_by_step": {},
+    }
+
+
 # ── Top-level orchestrator ────────────────────────────────────────────────────
 
 def run_all_diagnostics(
@@ -496,83 +582,76 @@ def run_all_diagnostics(
 
     results: list[_ExpResult] = []
     common: dict = {
-        "trainer.accumulate_grad_batches": 8,
+        "trainer.accumulate_grad_batches": 1,
+        "trainer.limit_train_batches": n_steps,
+        "trainer.limit_val_batches": 16,
         "debug": 1,
     }
 
     # ── Experiment 1: FP32 baseline ──────────────────────────────────────────
     print(f"[1/4] FP32 Baseline  ({n_steps} steps)")
-    cb1 = DiagnosticCallback(
-        csv_path=DIAG_OUT / "baseline_fp32.csv",
-        log_every=10,
-    )
-    _run_one(
+    r1 = _run_subprocess(
         raw_config_path, base_args,
         {**common, "trainer.precision": 32, "trainer.max_steps": n_steps},
-        cb1, seed=42, label="Exp1-FP32",
+        csv_path=DIAG_OUT / "baseline_fp32.csv",
+        seed=42, label="Exp1-FP32",
     )
-    fp32_losses = cb1.losses_by_step
+    fp32_losses = r1["losses_by_step"]
     results.append(_ExpResult(
         label="1  FP32 Baseline",
-        final_loss=cb1.final_loss,
+        final_loss=r1["final_loss"],
         diverge_step=None,
-        peak_memory_mb=cb1.peak_memory_mb,
-        nan_module=cb1._nan_first,
+        peak_memory_mb=r1["peak_memory_mb"],
+        nan_module=r1["nan_first"],
     ))
-    print(f"  → loss={cb1.final_loss}  mem={cb1.peak_memory_mb:.0f} MB\n")
+    print(f"  → loss={r1['final_loss']}  mem={r1['peak_memory_mb']:.0f} MB\n")
 
     # ── Experiment 2: BF16 baseline ───────────────────────────────────────────
     print(f"[2/4] BF16-mixed Baseline  ({n_steps} steps)")
-    cb2 = DiagnosticCallback(
-        csv_path=DIAG_OUT / "baseline_bf16.csv",
-        log_every=10,
-        reference_losses=fp32_losses,
-    )
-    _run_one(
+    r2 = _run_subprocess(
         raw_config_path, base_args,
         {**common, "trainer.precision": "bf16-mixed", "trainer.max_steps": n_steps},
-        cb2, seed=42, label="Exp2-BF16",
+        csv_path=DIAG_OUT / "baseline_bf16.csv",
+        seed=42, label="Exp2-BF16",
+        reference_losses=fp32_losses,
     )
-    bf16_losses = cb2.losses_by_step
+    bf16_losses = r2["losses_by_step"]
     results.append(_ExpResult(
         label="2  BF16 Baseline",
-        final_loss=cb2.final_loss,
-        diverge_step=cb2.diverge_step,
-        peak_memory_mb=cb2.peak_memory_mb,
-        nan_module=cb2._nan_first,
+        final_loss=r2["final_loss"],
+        diverge_step=r2["diverge_step"],
+        peak_memory_mb=r2["peak_memory_mb"],
+        nan_module=r2["nan_first"],
     ))
     print(
-        f"  → loss={cb2.final_loss}  mem={cb2.peak_memory_mb:.0f} MB"
-        f"  diverge_step={cb2.diverge_step or '—'}\n"
+        f"  → loss={r2['final_loss']}  mem={r2['peak_memory_mb']:.0f} MB"
+        f"  diverge_step={r2['diverge_step'] or '—'}\n"
     )
 
     # ── Experiment 3: Naive FP8 (all linears) ────────────────────────────────
     print(f"[3/4] Naive FP8 – all Linear  ({n_steps} steps)")
-    cb3 = DiagnosticCallback(
+    r3 = _run_subprocess(
+        raw_config_path, base_args,
+        {**common, "trainer.precision": "bf16-mixed", "trainer.max_steps": n_steps},
         csv_path=DIAG_OUT / "naive_fp8_all.csv",
-        log_every=10,
+        fp8_mode="all", seed=42, label="Exp3-FP8-all",
         reference_losses=bf16_losses,
         enable_nan_hooks=True,
         enable_grad_stats=True,
         grad_csv_path=DIAG_OUT / "gradient_stats.csv",
         grad_log_every=50,
     )
-    _run_one(
-        raw_config_path, base_args,
-        {**common, "trainer.precision": "bf16-mixed", "trainer.max_steps": n_steps},
-        cb3, fp8_mode="all", seed=42, label="Exp3-FP8-all",
-    )
     results.append(_ExpResult(
         label="3  FP8 All Linear",
-        final_loss=cb3.final_loss,
-        diverge_step=cb3.diverge_step,
-        peak_memory_mb=cb3.peak_memory_mb,
-        nan_module=cb3._nan_first,
+        final_loss=r3["final_loss"],
+        diverge_step=r3["diverge_step"],
+        peak_memory_mb=r3["peak_memory_mb"],
+        nan_module=r3["nan_first"],
     ))
     print(
-        f"  → loss={cb3.final_loss}  mem={cb3.peak_memory_mb:.0f} MB"
-        f"  diverge_step={cb3.diverge_step or '—'}"
-        f"  nan_module={cb3._nan_first or '—'}\n"
+        f"  → loss={r3['final_loss']}  mem={r3['peak_memory_mb']:.0f} MB"
+        f"  diverge_step={r3['diverge_step'] or '—'}"
+        f"  nan_module={r3['nan_first'] or '—'}\n"
     )
 
     # ── Experiment 4: Module-level FP8 ablation ───────────────────────────────
@@ -588,35 +667,32 @@ def run_all_diagnostics(
 
     for sub_id, fp8_mode, desc in sub_experiments:
         print(f"  [{sub_id}] FP8 on: {desc}")
-        cb4 = DiagnosticCallback(
-            csv_path=DIAG_OUT / f"ablation_{sub_id}_{fp8_mode}.csv",
-            log_every=10,
-            reference_losses=bf16_losses,
-        )
-        _run_one(
+        r4 = _run_subprocess(
             raw_config_path, base_args,
             {**common, "trainer.precision": "bf16-mixed",
              "trainer.max_steps": sub_steps},
-            cb4, fp8_mode=fp8_mode, seed=42, label=f"Exp{sub_id}",
+            csv_path=DIAG_OUT / f"ablation_{sub_id}_{fp8_mode}.csv",
+            fp8_mode=fp8_mode, seed=42, label=f"Exp{sub_id}",
+            reference_losses=bf16_losses,
         )
         ablation_rows.append({
             "sub_experiment": sub_id,
             "fp8_module_group": desc,
-            "final_loss": cb4.final_loss,
-            "divergence_occurred": cb4.diverge_step is not None,
-            "first_divergence_step": cb4.diverge_step,
-            "peak_memory_mb": cb4.peak_memory_mb,
+            "final_loss": r4["final_loss"],
+            "divergence_occurred": r4["diverge_step"] is not None,
+            "first_divergence_step": r4["diverge_step"],
+            "peak_memory_mb": r4["peak_memory_mb"],
         })
         results.append(_ExpResult(
             label=f"4{sub_id} FP8-{fp8_mode}",
-            final_loss=cb4.final_loss,
-            diverge_step=cb4.diverge_step,
-            peak_memory_mb=cb4.peak_memory_mb,
-            nan_module=cb4._nan_first,
+            final_loss=r4["final_loss"],
+            diverge_step=r4["diverge_step"],
+            peak_memory_mb=r4["peak_memory_mb"],
+            nan_module=r4["nan_first"],
         ))
         print(
-            f"    → loss={cb4.final_loss}"
-            f"  diverge_step={cb4.diverge_step or '—'}\n"
+            f"    → loss={r4['final_loss']}"
+            f"  diverge_step={r4['diverge_step'] or '—'}\n"
         )
     _append_csv(DIAG_OUT / "module_ablation.csv", ablation_rows)
 
