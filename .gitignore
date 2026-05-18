@@ -172,3 +172,5 @@ openfold_processed_msa
 rcsb_processed_targets
 rcsb_processed_msa
 symmetry.pkl
+
+outputs/
