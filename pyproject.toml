@@ -39,7 +39,7 @@ dependencies = [
     "seaborn>=0.13.2",
     "cuequivariance-torch>=0.10.0",
     "cuequivariance-ops-torch-cu12>=0.10.0",
-    "transformer-engine>=2.15.0",
+    "transformer-engine[core]>=2.15.0",
 ]
 
 [project.scripts]

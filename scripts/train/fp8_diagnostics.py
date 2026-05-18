@@ -26,20 +26,12 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 
-# ── Optional Transformer Engine ───────────────────────────────────────────────
-TE_AVAILABLE = False
-_FP8_RECIPE = None
-try:
-    import transformer_engine.pytorch as te  # noqa: F401 (used below)
-    from transformer_engine.common.recipe import DelayedScaling, Format
+# ── Transformer Engine ───────────────────────────────────────────────────────
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import DelayedScaling, Format
 
-    _FP8_RECIPE = DelayedScaling(fp8_format=Format.HYBRID)
-    TE_AVAILABLE = True
-except Exception as _te_err:
-    raise ImportError(
-        "transformer_engine is not available. FP8 diagnostics will be skipped."
-    ) from _te_err
-    
+_FP8_RECIPE = DelayedScaling(fp8_format=Format.HYBRID)
+
 # ── Boltz module types used for hooks / FP8 targeting ────────────────────────
 from boltz.model.layers.triangular_mult import (
     TriangleMultiplicationIncoming,
@@ -92,8 +84,6 @@ def _replace_linear_with_te(module: nn.Module, _depth: int = 0) -> int:
 
     Returns the number of replacements made.
     """
-    if not TE_AVAILABLE:
-        return 0
     replaced = 0
     for name, child in list(module.named_children()):
         if type(child) is nn.Linear:
@@ -123,8 +113,6 @@ def _wrap_fp8_autocast(model: nn.Module, target_types: tuple) -> list:
     so callers can undo the patch.
     """
     handles: list[tuple] = []
-    if not TE_AVAILABLE:
-        return handles
     recipe = _FP8_RECIPE
     for mod in model.modules():
         if isinstance(mod, target_types):
@@ -376,7 +364,6 @@ class _ExpResult:
     diverge_step: Optional[int]
     peak_memory_mb: float
     nan_module: Optional[str]
-    skipped: bool = False
 
 
 def _run_one(
@@ -442,7 +429,7 @@ def _run_one(
 
     # ── FP8 patching ─────────────────────────────────────────────────────────
     fp8_restore: list = []
-    if fp8_mode and TE_AVAILABLE:
+    if fp8_mode:
         if fp8_mode == "all":
             n = _replace_linear_with_te(model)
             print(f"  Replaced {n} nn.Linear → te.Linear")
@@ -460,8 +447,6 @@ def _run_one(
             if targets:
                 fp8_restore = _wrap_fp8_autocast(model, targets)
                 print(f"  fp8_autocast applied to {len(fp8_restore)} {fp8_mode} modules")
-    elif fp8_mode and not TE_AVAILABLE:
-        print(f"  [skip] FP8 mode='{fp8_mode}' requested but TE unavailable")
 
     # ── Run trainer ───────────────────────────────────────────────────────────
     trainer = pl.Trainer(
@@ -514,7 +499,7 @@ def run_all_diagnostics(
     """
     DIAG_OUT.mkdir(parents=True, exist_ok=True)
     print(f"\n{'='*72}")
-    print(f"  FP8 Diagnostics  |  output: {DIAG_OUT}  |  steps={n_steps}  |  TE={TE_AVAILABLE}")
+    print(f"  FP8 Diagnostics  |  output: {DIAG_OUT}  |  steps={n_steps}")
     print(f"{'='*72}\n")
 
     results: list[_ExpResult] = []
@@ -571,40 +556,32 @@ def run_all_diagnostics(
 
     # ── Experiment 3: Naive FP8 (all linears) ────────────────────────────────
     print(f"[3/4] Naive FP8 – all Linear  ({n_steps} steps)")
-    if TE_AVAILABLE:
-        cb3 = DiagnosticCallback(
-            csv_path=DIAG_OUT / "naive_fp8_all.csv",
-            log_every=10,
-            reference_losses=bf16_losses,
-            enable_nan_hooks=True,
-            enable_grad_stats=True,
-            grad_csv_path=DIAG_OUT / "gradient_stats.csv",
-            grad_log_every=50,
-        )
-        _run_one(
-            raw_config_path, base_args,
-            {**common, "trainer.precision": "bf16-mixed", "trainer.max_steps": n_steps},
-            cb3, fp8_mode="all", seed=42, label="Exp3-FP8-all",
-        )
-        results.append(_ExpResult(
-            label="3  FP8 All Linear",
-            final_loss=cb3.final_loss,
-            diverge_step=cb3.diverge_step,
-            peak_memory_mb=cb3.peak_memory_mb,
-            nan_module=cb3._nan_first,
-        ))
-        print(
-            f"  → loss={cb3.final_loss}  mem={cb3.peak_memory_mb:.0f} MB"
-            f"  diverge_step={cb3.diverge_step or '—'}"
-            f"  nan_module={cb3._nan_first or '—'}\n"
-        )
-    else:
-        results.append(_ExpResult(
-            label="3  FP8 All Linear",
-            final_loss=None, diverge_step=None,
-            peak_memory_mb=0, nan_module=None, skipped=True,
-        ))
-        print("  [skipped – transformer_engine not available]\n")
+    cb3 = DiagnosticCallback(
+        csv_path=DIAG_OUT / "naive_fp8_all.csv",
+        log_every=10,
+        reference_losses=bf16_losses,
+        enable_nan_hooks=True,
+        enable_grad_stats=True,
+        grad_csv_path=DIAG_OUT / "gradient_stats.csv",
+        grad_log_every=50,
+    )
+    _run_one(
+        raw_config_path, base_args,
+        {**common, "trainer.precision": "bf16-mixed", "trainer.max_steps": n_steps},
+        cb3, fp8_mode="all", seed=42, label="Exp3-FP8-all",
+    )
+    results.append(_ExpResult(
+        label="3  FP8 All Linear",
+        final_loss=cb3.final_loss,
+        diverge_step=cb3.diverge_step,
+        peak_memory_mb=cb3.peak_memory_mb,
+        nan_module=cb3._nan_first,
+    ))
+    print(
+        f"  → loss={cb3.final_loss}  mem={cb3.peak_memory_mb:.0f} MB"
+        f"  diverge_step={cb3.diverge_step or '—'}"
+        f"  nan_module={cb3._nan_first or '—'}\n"
+    )
 
     # ── Experiment 4: Module-level FP8 ablation ───────────────────────────────
     sub_steps = max(n_steps // 2, 50)
@@ -617,48 +594,39 @@ def run_all_diagnostics(
     ]
     ablation_rows: list[dict] = []
 
-    if TE_AVAILABLE:
-        for sub_id, fp8_mode, desc in sub_experiments:
-            print(f"  [{sub_id}] FP8 on: {desc}")
-            cb4 = DiagnosticCallback(
-                csv_path=DIAG_OUT / f"ablation_{sub_id}_{fp8_mode}.csv",
-                log_every=10,
-                reference_losses=bf16_losses,
-            )
-            _run_one(
-                raw_config_path, base_args,
-                {**common, "trainer.precision": "bf16-mixed",
-                 "trainer.max_steps": sub_steps},
-                cb4, fp8_mode=fp8_mode, seed=42, label=f"Exp{sub_id}",
-            )
-            ablation_rows.append({
-                "sub_experiment": sub_id,
-                "fp8_module_group": desc,
-                "final_loss": cb4.final_loss,
-                "divergence_occurred": cb4.diverge_step is not None,
-                "first_divergence_step": cb4.diverge_step,
-                "peak_memory_mb": cb4.peak_memory_mb,
-            })
-            results.append(_ExpResult(
-                label=f"4{sub_id} FP8-{fp8_mode}",
-                final_loss=cb4.final_loss,
-                diverge_step=cb4.diverge_step,
-                peak_memory_mb=cb4.peak_memory_mb,
-                nan_module=cb4._nan_first,
-            ))
-            print(
-                f"    → loss={cb4.final_loss}"
-                f"  diverge_step={cb4.diverge_step or '—'}\n"
-            )
-        _append_csv(DIAG_OUT / "module_ablation.csv", ablation_rows)
-    else:
-        for sub_id, fp8_mode, desc in sub_experiments:
-            results.append(_ExpResult(
-                label=f"4{sub_id} FP8-{fp8_mode}",
-                final_loss=None, diverge_step=None,
-                peak_memory_mb=0, nan_module=None, skipped=True,
-            ))
-        print("  [skipped – transformer_engine not available]\n")
+    for sub_id, fp8_mode, desc in sub_experiments:
+        print(f"  [{sub_id}] FP8 on: {desc}")
+        cb4 = DiagnosticCallback(
+            csv_path=DIAG_OUT / f"ablation_{sub_id}_{fp8_mode}.csv",
+            log_every=10,
+            reference_losses=bf16_losses,
+        )
+        _run_one(
+            raw_config_path, base_args,
+            {**common, "trainer.precision": "bf16-mixed",
+             "trainer.max_steps": sub_steps},
+            cb4, fp8_mode=fp8_mode, seed=42, label=f"Exp{sub_id}",
+        )
+        ablation_rows.append({
+            "sub_experiment": sub_id,
+            "fp8_module_group": desc,
+            "final_loss": cb4.final_loss,
+            "divergence_occurred": cb4.diverge_step is not None,
+            "first_divergence_step": cb4.diverge_step,
+            "peak_memory_mb": cb4.peak_memory_mb,
+        })
+        results.append(_ExpResult(
+            label=f"4{sub_id} FP8-{fp8_mode}",
+            final_loss=cb4.final_loss,
+            diverge_step=cb4.diverge_step,
+            peak_memory_mb=cb4.peak_memory_mb,
+            nan_module=cb4._nan_first,
+        ))
+        print(
+            f"    → loss={cb4.final_loss}"
+            f"  diverge_step={cb4.diverge_step or '—'}\n"
+        )
+    _append_csv(DIAG_OUT / "module_ablation.csv", ablation_rows)
 
     # ── Summary table ─────────────────────────────────────────────────────────
     cols = [
@@ -669,13 +637,6 @@ def run_all_diagnostics(
         ("NaN Module",      30),
     ]
 
-    def _fmt(v, w: int) -> str:
-        s = "SKIPPED" if v is None and True else (
-            "—" if v is None else
-            f"{v:.4f}" if isinstance(v, float) else str(v)
-        )
-        return s[:w].ljust(w)
-
     header = "  ".join(name.ljust(w) for name, w in cols)
     sep    = "  ".join("-" * w for _, w in cols)
 
@@ -685,16 +646,13 @@ def run_all_diagnostics(
     print(header)
     print(sep)
 
-    col_keys = [
-        "label", "final_loss", "diverge_step", "peak_memory_mb", "nan_module"
-    ]
     for r in results:
         row_vals = [
             r.label,
-            "SKIPPED" if r.skipped else r.final_loss,
-            "SKIPPED" if r.skipped else (r.diverge_step or "—"),
-            "SKIPPED" if r.skipped else r.peak_memory_mb,
-            "SKIPPED" if r.skipped else (r.nan_module or "—"),
+            r.final_loss,
+            r.diverge_step or "—",
+            r.peak_memory_mb,
+            r.nan_module or "—",
         ]
         line = "  ".join(
             (str(v)[:w]).ljust(w) if not isinstance(v, float)
