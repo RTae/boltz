@@ -391,7 +391,6 @@ def _run_one(
     import omegaconf
     from omegaconf import OmegaConf
     from boltz.data.module.training import BoltzTrainingDataModule, DataConfig
-
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     if torch.backends.cudnn.is_available():
@@ -417,14 +416,7 @@ def _run_one(
     # Ensure debug-mode keys are applied
     trainer_kw["devices"] = 1
 
-    try:
-        data_dict = OmegaConf.to_container(cfg.data, resolve=True)
-        data_dict["num_workers"] = 0
-        data_config = DataConfig(**data_dict)
-    except Exception as exc:
-        print(f"  [error] DataConfig build failed: {exc}")
-        return
-
+    data_config = DataConfig(**cfg.data)
     data_module = BoltzTrainingDataModule(data_config)
 
     # ── FP8 patching ─────────────────────────────────────────────────────────
