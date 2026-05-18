@@ -16,8 +16,10 @@ from __future__ import annotations
 import csv
 import functools
 import gc
+from queue import Empty
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -248,19 +250,22 @@ class DiagnosticCallback(pl.Callback):
                 if self.diverge_step is None:
                     self.diverge_step = step
 
-        if step % self.log_every == 0:
-            rec = {
-                "step": step,
-                "loss": loss,
-                "peak_memory_mb": round(peak_mb, 1),
-                "step_time_ms": round(elapsed_ms, 1),
-                "throughput_steps_per_sec": round(
-                    1000.0 / max(elapsed_ms, 1e-9), 4
-                ),
-                "diverged": diverged,
-                "nan_module": self._nan_first,
-            }
-            self.records.append(rec)
+        rec = {
+            "step": step,
+            "loss": loss,
+            "peak_memory_mb": round(peak_mb, 1),
+            "step_time_ms": round(elapsed_ms, 1),
+            "throughput_steps_per_sec": round(
+                1000.0 / max(elapsed_ms, 1e-9), 4
+            ),
+            "diverged": diverged,
+            "nan_module": self._nan_first,
+        }
+        self.records.append(rec)
+
+        max_steps = getattr(trainer, "max_steps", None)
+        is_final_step = isinstance(max_steps, int) and max_steps > 0 and step >= max_steps
+        if step % self.log_every == 0 or is_final_step:
             _append_csv(self.csv_path, [rec])
 
     # ── NaN forward hooks ─────────────────────────────────────────────────────
@@ -490,23 +495,30 @@ def _exp_worker(
     label: str,
 ) -> None:
     """Runs inside a spawned subprocess for a clean CUDA allocator state."""
-    cb = DiagnosticCallback(
-        csv_path=Path(csv_path),
-        log_every=log_every,
-        reference_losses=reference_losses,
-        enable_nan_hooks=enable_nan_hooks,
-        enable_grad_stats=enable_grad_stats,
-        grad_csv_path=Path(grad_csv_path) if grad_csv_path else None,
-        grad_log_every=grad_log_every,
-    )
-    _run_one(raw_config_path, base_args, config_overrides, cb, fp8_mode, seed, label)
-    result_q.put({
-        "final_loss": cb.final_loss,
-        "diverge_step": cb.diverge_step,
-        "peak_memory_mb": cb.peak_memory_mb,
-        "nan_first": cb._nan_first,
-        "losses_by_step": cb.losses_by_step,
-    })
+    try:
+        cb = DiagnosticCallback(
+            csv_path=Path(csv_path),
+            log_every=log_every,
+            reference_losses=reference_losses,
+            enable_nan_hooks=enable_nan_hooks,
+            enable_grad_stats=enable_grad_stats,
+            grad_csv_path=Path(grad_csv_path) if grad_csv_path else None,
+            grad_log_every=grad_log_every,
+        )
+        _run_one(raw_config_path, base_args, config_overrides, cb, fp8_mode, seed, label)
+        result_q.put({
+            "ok": True,
+            "final_loss": cb.final_loss,
+            "diverge_step": cb.diverge_step,
+            "peak_memory_mb": cb.peak_memory_mb,
+            "nan_first": cb._nan_first,
+            "losses_by_step": cb.losses_by_step,
+        })
+    except Exception:
+        result_q.put({
+            "ok": False,
+            "error": traceback.format_exc(),
+        })
 
 
 def _run_subprocess(
@@ -538,23 +550,34 @@ def _run_subprocess(
         target=_exp_worker,
         args=(
             q, raw_config_path, base_args, config_overrides,
-            str(csv_path), log_every, reference_losses or {},
+            str(csv_path.resolve()), log_every, reference_losses or {},
             enable_nan_hooks, enable_grad_stats,
-            str(grad_csv_path) if grad_csv_path else None, grad_log_every,
+            str(grad_csv_path.resolve()) if grad_csv_path else None, grad_log_every,
             fp8_mode, seed, label,
         ),
     )
     p.start()
     p.join()
-    if not q.empty():
-        return q.get()
-    return {
-        "final_loss": None,
-        "diverge_step": None,
-        "peak_memory_mb": 0.0,
-        "nan_first": None,
-        "losses_by_step": {},
-    }
+    if p.exitcode != 0:
+        raise RuntimeError(
+            f"diagnostic subprocess failed for {label or csv_path.name} with exit code {p.exitcode}"
+        )
+
+    try:
+        result = q.get(timeout=5)
+    except Empty as exc:
+        raise RuntimeError(
+            f"diagnostic subprocess for {label or csv_path.name} exited without returning results"
+        ) from exc
+
+    if not result.get("ok", True):
+        raise RuntimeError(
+            f"diagnostic subprocess raised an exception for {label or csv_path.name}:\n"
+            f"{result.get('error', 'unknown error')}"
+        )
+
+    result.pop("ok", None)
+    return result
 
 
 # ── Top-level orchestrator ────────────────────────────────────────────────────
