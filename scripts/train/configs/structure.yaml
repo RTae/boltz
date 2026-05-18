@@ -6,6 +6,7 @@ trainer:
   max_epochs: -1
   max_steps: 200
   accumulate_grad_batches: 128    # to adjust depending on the number of devices
+  limit_val_batches: 16
 
 # Optional set wandb here
 # wandb:
@@ -57,7 +58,7 @@ data:
   pad_to_max_tokens: true
   pad_to_max_atoms: true
   pad_to_max_seqs: true
-  samples_per_epoch: 10
+  samples_per_epoch: 20
   batch_size: 1
   num_workers: 4
   random_seed: 42
